@@ -1,0 +1,48 @@
+2024-12-05 20:43:22.478948: I tensorflow/core/util/port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+2024-12-05 20:43:22.490478: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:477] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+E0000 00:00:1733449402.504163 3883208 cuda_dnn.cc:8310] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+E0000 00:00:1733449402.508039 3883208 cuda_blas.cc:1418] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+2024-12-05 20:43:22.522336: I tensorflow/core/platform/cpu_feature_guard.cc:210] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: AVX2 AVX512F AVX512_VNNI AVX512_BF16 AVX512_FP16 AVX_VNNI AMX_TILE AMX_INT8 AMX_BF16 FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+Results saved in runs/time_emb_mlp/runs30/
+Files already downloaded and verified
+Files already downloaded and verified
+tensor(0.) tensor(1.)
+Thu Dec  5 20:43:26 2024       
++---------------------------------------------------------------------------------------+
+| NVIDIA-SMI 535.129.03             Driver Version: 535.129.03   CUDA Version: 12.2     |
+|-----------------------------------------+----------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id        Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |         Memory-Usage | GPU-Util  Compute M. |
+|                                         |                      |               MIG M. |
+|=========================================+======================+======================|
+|   0  NVIDIA H100 80GB HBM3          On  | 00000000:61:00.0 Off |                    0 |
+| N/A   26C    P0              81W / 700W |    531MiB / 81559MiB |      1%      Default |
+|                                         |                      |             Disabled |
++-----------------------------------------+----------------------+----------------------+
+                                                                                         
++---------------------------------------------------------------------------------------+
+| Processes:                                                                            |
+|  GPU   GI   CI        PID   Type   Process name                            GPU Memory |
+|        ID   ID                                                             Usage      |
+|=======================================================================================|
+|    0   N/A  N/A   3883208      C   python                                      518MiB |
++---------------------------------------------------------------------------------------+
+
+Traceback (most recent call last):
+  File "/home/juntingd/research/CellNN/PyCNN/train_time_emb_mlp.py", line 231, in <module>
+    trainer.train(model=model,
+  File "/home/juntingd/research/CellNN/PyCNN/train_time_emb_mlp.py", line 115, in train
+    ode_result = RK4_altstep_solver(images, t=torch.linspace(0, 10, 11).to(device), dt=1, u=images, func=model.ode_func)
+  File "/home/juntingd/research/CellNN/PyCNN/general.py", line 334, in RK4_altstep_solver
+    k3 = func(t, y[-1] + dt * (k2 - k1 * _one_third), u)
+  File "/home/juntingd/.local/lib/python3.9/site-packages/torch/nn/modules/module.py", line 1511, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/juntingd/.local/lib/python3.9/site-packages/torch/nn/modules/module.py", line 1520, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/juntingd/research/CellNN/PyCNN/general.py", line 81, in forward
+    dy1 = -y + self.Ib + self.B1(u) + self.A1(self.cnn(y))
+  File "/home/juntingd/research/CellNN/PyCNN/general.py", line 78, in cnn
+    return 0.5 * (abs(x + 1) - abs(x - 1))
+torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB. GPU 0 has a total capacity of 79.11 GiB of which 8.50 MiB is free. Including non-PyTorch memory, this process has 79.09 GiB memory in use. Of the allocated memory 71.88 GiB is allocated by PyTorch, and 6.35 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
