@@ -22,6 +22,7 @@ from torchvision.datasets import CIFAR10
 from torchvision.models import EfficientNet
 from torchvision.ops.misc import SqueezeExcitation, Conv2dNormActivation
 from torch.nn.modules.container import Sequential
+import copy
 
 from quantization import quantizearray
 
@@ -44,10 +45,11 @@ def args_parser():
     parser.add_argument('--quant_w',  default=True, action='store_true')
     parser.add_argument('--quant_x',  default=True, action='store_true')
     parser.add_argument('--eps', default=0., type=float)
-    parser.add_argument('--bitwidth_w', default=32, type=int)
-    parser.add_argument('--intbit_w', default=16, type=int)
-    parser.add_argument('--bitwidth_x', default=32, type=int)
-    parser.add_argument('--intbit_x', default=16, type=int)
+    parser.add_argument('--bitwidth_w', default=8, type=int)
+    parser.add_argument('--intbit_w', default=4, type=int)
+    parser.add_argument('--bitwidth_x', default=8, type=int)
+    parser.add_argument('--intbit_x', default=4, type=int)
+    parser.add_argument('--update_freq', default=1, type=int)
 
     parser.add_argument('--lr', default=1e-3, type=float)
     parser.add_argument('--k', default=3, type=int)
@@ -63,46 +65,6 @@ def args_parser():
     parser.add_argument('--weight_decay', default=0, type=float)
     parser.add_argument('--lr_scheduler', action='store_true')
     return parser.parse_args()
-
-class SequentialWapper(nn.Sequential):
-    def __init__(self, sequential, is_squeeze=False, is_MBConv=False, stochastic_depth=None):
-        super().__init__()
-        self.is_squeeze = is_squeeze
-        self.is_MBConv = is_MBConv
-        self.stochastic_depth = stochastic_depth
-
-        for k, m in enumerate(sequential):
-            self.add_module(str(k), m)
-    
-    # input: [input_fp, input_quant]
-    def forward(self, input):
-        for module in self:
-            if isinstance(module, QuantizedWrapper):
-                output = [module.forward(input[0], fp=True), module.forward(input[1], fp=False)]
-            else:
-                output = [module(input[0]), module(input[1])]
-                if self.is_squeeze:
-                    return [output[0] * input[0], output[1] * input[1]]
-                elif self.is_MBConv:
-                    return [self.stochastic_depth(output[0]) + input[0], self.stochastic_depth(output[1]) + input[1]]
-        return output
-
-def apply_sequential(model):
-    for name, module in model.named_children():
-        if isinstance(module, nn.Sequential):   
-            setattr(model, name, SequentialWapper(module))
-        elif isinstance(module, SqueezeExcitation):
-            seqs = nn.Sequential(
-                module.avgpool,
-                module.fc1,
-                module.activation,
-                module.fc2,
-                module.scale_activation
-            )
-            setattr(model, name, SequentialWapper(seqs, is_squeeze=True))
-    
-        apply_sequential(getattr(model, name))
-    return model
     
 class FakeQuantizeSTE(torch.autograd.Function):
     @staticmethod
@@ -131,26 +93,27 @@ class QuantizedWrapper(nn.Module):
         self.qstep_x = pow(2, intbit_x) / pow(2, bitwidth_x)
         self.qmax_x = pow(2, intbit_x)/2 - self.qstep_x
         self.qmin_x = -pow(2, intbit_x)/2
-        self.full_precision_weight = nn.Parameter(self.module.weight)  
+        self.full_precision_weight = nn.Parameter(self.module.weight) 
+        self.fp = False 
 
-    def forward(self, x, fp = False):
+    def forward(self, x):
         quantized_weight = FakeQuantizeSTE.apply(self.full_precision_weight, self.qstep_w, self.qmin_w, self.qmax_w) if self.quant_w else self.full_precision_weight
         if isinstance(self.module, nn.Linear):
-            if fp:
-                return F.linear(x, self.full_precision_weight, self.module.bias)
-            else:
+            if not self.fp:
                 y = F.linear(x, quantized_weight, self.module.bias)
                 y = FakeQuantizeSTE.apply(y, self.qstep_x, self.qmin_x, self.qmax_x) if self.quant_x else y
                 return y
-        elif isinstance(self.module, nn.Conv2d):
-            if fp:
-                return F.conv2d(x, self.full_precision_weight, self.module.bias, stride=self.module.stride, 
-                            padding=self.module.padding, groups=self.module.groups, dilation=self.module.dilation)
             else:
+                return F.linear(x, self.full_precision_weight, self.module.bias)
+        elif isinstance(self.module, nn.Conv2d):
+            if not self.fp:
                 y = F.conv2d(x, quantized_weight, self.module.bias, stride=self.module.stride, 
                                 padding=self.module.padding, groups=self.module.groups, dilation=self.module.dilation)
                 y = FakeQuantizeSTE.apply(y, self.qstep_x, self.qmin_x, self.qmax_x) if self.quant_x else y
-                return y
+                return y  
+            else:
+                return F.conv2d(x, self.full_precision_weight, self.module.bias, stride=self.module.stride, 
+                            padding=self.module.padding, groups=self.module.groups, dilation=self.module.dilation)
         else:
             raise TypeError("Unsupported layer type for QAT")
 
@@ -161,6 +124,14 @@ def apply_quantization(model, quant_w=True, quant_x=True, bitwidth_w=16, intbit_
         else:
             apply_quantization(module, quant_w, quant_x, bitwidth_w, intbit_w, bitwidth_x, intbit_x) 
     return model
+
+def kl_loss(output_quantized, output_full_precision):
+    """
+    Compute KL divergence loss between quantized and full-precision outputs.
+    """
+    log_prob_q = F.log_softmax(output_quantized, dim=-1)  # Log softmax for quantized output
+    prob_fp = F.softmax(output_full_precision, dim=-1)  # Softmax for full-precision output
+    return F.kl_div(log_prob_q, prob_fp, reduction='batchmean')  # KL loss
 
 if __name__=="__main__":
     args = args_parser()
@@ -186,6 +157,7 @@ if __name__=="__main__":
     intbit_w = args.intbit_w
     bitwidth_x = args.bitwidth_x
     intbit_x = args.intbit_x
+    update_freq = args.update_freq
 
     qstep_x = pow(2, intbit_x) / pow(2, bitwidth_x)
     qmax_x = pow(2, intbit_x)/2 - qstep_x
@@ -235,12 +207,15 @@ if __name__=="__main__":
         model = torchvision.models.efficientnet_b0(weights = 'DEFAULT')
         model.classifier[1] = nn.Linear(model.classifier[1].in_features, 10)
         model = model.to(device)
-        if quant_kl:
-            model = apply_sequential(model)
         if quant_w or quant_x:
             # EfficientNet.forward_quant = forward_quant.__get__(model)
             model = apply_quantization(model, quant_w=quant_w, quant_x=quant_x, bitwidth_w=bitwidth_w, 
                                        intbit_w=intbit_w, bitwidth_x=bitwidth_x, intbit_x=intbit_x)
+        if quant_kl:
+            model_fp = copy.deepcopy(model)
+            for module in model_fp.modules():
+                if isinstance(module, QuantizedWrapper):
+                    module.fp = True
 
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=args.weight_decay)
     if args.lr_scheduler:
@@ -251,6 +226,8 @@ if __name__=="__main__":
     loss_curve_val = []
     acc_curve = []
     acc_curve_val = []
+    acc_curve_fp = []
+    acc_curve_fp_val = []
     start = time.time()
     iters = len(train_loader)
     grad_states = []
@@ -259,13 +236,21 @@ if __name__=="__main__":
         loss_ep_val = []
         acc_ep = []
         acc_ep_val = []
+        acc_ep_fp = []
+        acc_ep_fp_val = []
+
         for batch_i, (images, labels) in enumerate(train_loader):
             optimizer.zero_grad()
             grad_state={}
-            images, labels = images.to(device), labels.to(device)
-            images_q = FakeQuantizeSTE.apply(images, qstep_x, qmin_x, qmax_x) if quant_x else images
-            pred = model([images, images_q])
-            loss = criterion(pred, labels)
+            images_fp, labels = images.to(device), labels.to(device)
+            with torch.no_grad():
+                pred_fp = model_fp(images_fp)
+            images = FakeQuantizeSTE.apply(images_fp, qstep_x, qmin_x, qmax_x) if quant_x else images
+            pred = model(images)
+            loss_ce_fp = criterion(pred_fp, labels) 
+            loss_ce = criterion(pred, labels) 
+            loss_kl = kl_loss(pred, pred_fp)
+            loss = loss_ce + loss_kl + loss_ce_fp
             writer.add_scalar("Loss/train", loss, epoch)
             loss.backward()
             optimizer.step()
@@ -284,18 +269,33 @@ if __name__=="__main__":
             loss_ep.append(loss.item())
             acc_ep.append(acc.item())
 
+            pred_fp = torch.argmax(pred_fp, dim=1)
+            acc_fp = torch.tensor(pred_fp==labels, dtype=torch.float).mean()
+            writer.add_scalar("Acc-FP/train", acc_fp, epoch)
+            acc_ep_fp.append(acc_fp.item())
+
+            with torch.no_grad():  
+                for param_fp, param_qt in zip(model_fp.parameters(), model.parameters()):
+                    param_fp.copy_(param_qt)
+
         
         for batch_i, (images, labels) in enumerate(val_loader):
-            images, labels = images.to(device), labels.to(device)
-            images_q = FakeQuantizeSTE.apply(images, qstep_x, qmin_x, qmax_x) if quant_x else images
-            pred = model([images, images_q])
-            loss_val = criterion(pred, labels)
+            images_fp, labels = images.to(device), labels.to(device)
+            with torch.no_grad():
+                pred_fp = model_fp(images_fp)
+            images = FakeQuantizeSTE.apply(images_fp, qstep_x, qmin_x, qmax_x) if quant_x else images
+            pred = model(images)
+            loss_val = criterion(pred, labels) + criterion(pred_fp, labels) +  kl_loss(pred, pred_fp)
 
             pred = torch.argmax(pred, dim=1)
             acc_val = torch.tensor(pred==labels, dtype=torch.float).mean()
             
             loss_ep_val.append(loss_val.item())
             acc_ep_val.append(acc_val.item())
+
+            pred_fp = torch.argmax(pred_fp, dim=1)
+            acc_fp_val = torch.tensor(pred_fp==labels, dtype=torch.float).mean()
+            acc_ep_fp_val.append(acc_fp_val.item())
         
         for name, param in model.named_parameters():
             writer.add_scalar(name, param.reshape(-1)[0], epoch)
@@ -305,6 +305,8 @@ if __name__=="__main__":
         loss_val = sum(loss_ep_val)/len(val_loader)
         acc = sum(acc_ep)/len(train_loader)
         acc_val = sum(acc_ep_val)/len(val_loader)
+        acc_fp = sum(acc_ep_fp)/len(train_loader)
+        acc_fp_val = sum(acc_ep_fp_val)/len(val_loader)
         
         writer.add_scalar("Loss/val", loss_val, epoch)
         writer.add_scalar("Acc/val", acc_val, epoch)
@@ -313,9 +315,16 @@ if __name__=="__main__":
         loss_curve_val.append(loss_val)
         acc_curve.append(acc)
         acc_curve_val.append(acc_val)
+        acc_curve_fp.append(acc_fp)
+        acc_curve_fp_val.append(acc_fp_val)
+
+        if (epoch+1) % update_freq == 0:
+            with torch.no_grad():  
+                for param_fp, param_qt in zip(model_fp.parameters(), model.parameters()):
+                    param_fp.copy_(param_qt)
 
         if (epoch+1)%print_freq==0:
-            print(f'epoch:{epoch+1}, time:{(time.time() - start):.2f}, loss:{loss:.4f}, acc:{acc:.4f}, loss_val:{loss_val:.4f}, acc_val:{acc_val:.4f}')
+            print(f'epoch:{epoch+1}, time:{(time.time() - start):.2f}, loss:{loss:.4f}, acc:{acc:.4f}, acc_fp:{acc_fp:.4f}, loss_val:{loss_val:.4f}, acc_val:{acc_val:.4f}, acc_fp_val:{acc_fp_val:.4f}')
 
         if save_ckp and (epoch+1)%save_freq==0:
             torch.save(model, save_path+f'tmax{t_max}_tstep{t_step_max}_epoch{epoch+1}_tacc{acc:.3f}_vacc{acc_val:.3f}.ckp')
@@ -331,4 +340,4 @@ if __name__=="__main__":
     plt.legend()
     plt.savefig(save_path + f'tmax{t_max}_tstep{t_step_max}_acc.jpg')
     print(f'Finished. Results saved in {save_path}')
-    # np.save(save_path+'grad_states.npy', grad_states)
+    np.save(save_path+'grad_states.npy', grad_states)
