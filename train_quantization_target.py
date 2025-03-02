@@ -34,25 +34,23 @@ def init_seeds(seed=0, deterministic=False):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)  # for Multi-GPU, exception safe
 
-
 def args_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', default=0)
     parser.add_argument('--model', default='efficientnet', choices=['vgg16', 'mobilenetv3', 'efficientnet', 'resnet18'])
-    parser.add_argument('--load_path', default='', type=str, 
-                        choices=['./images/test_training/runs543/epoch50_tacc0.998_vacc0.914.ckp'])
+    parser.add_argument('--load_path', default='./images/test_training/runs543/epoch50_tacc0.998_vacc0.914.ckp', type=str)
     parser.add_argument('--myvgg', action='store_true')
     parser.add_argument('--fp_only', action='store_true')
-    parser.add_argument('--fp_fixed', default=True,  action='store_true')
+    parser.add_argument('--fp_fixed', action='store_true')
 
-    parser.add_argument('--quant_scaler', default=True, action='store_true')
     parser.add_argument('--quant_kl', action='store_true')
     parser.add_argument('--quant_w', default=True, action='store_true')
     parser.add_argument('--quant_x', default=True, action='store_true')
+    
     parser.add_argument('--eps', default=0., type=float)
-    parser.add_argument('--bitwidth_w', default=32, type=int)
+    parser.add_argument('--bitwidth_w', default=8, type=int)
     parser.add_argument('--intbit_w', default=2, type=int)
-    parser.add_argument('--bitwidth_x', default=32, type=int)
+    parser.add_argument('--bitwidth_x', default=8, type=int)
     parser.add_argument('--intbit_x', default=6, type=int)
     parser.add_argument('--update_freq', default=1, type=int)
 
@@ -81,36 +79,12 @@ class FakeQuantizeSTE(torch.autograd.Function):
     def backward(self, grad_output):
         return grad_output, None, None, None
 
-class RoundWrapper(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, weights, alpha, qmin, qmax):
-        ctx.save_for_backward(weights, alpha)
-        ctx.other = qmin, qmax
-        _weights_q = (weights/alpha).round().clamp(qmin, qmax)
-        weights_q = _weights_q * alpha
-        return weights_q
-
-    @staticmethod
-    def backward(ctx, grad_weight):
-        weights, alpha = ctx.saved_tensors
-        qmin, qmax = ctx.other
-        _weights_q = weights/alpha
-
-        ind_small = (_weights_q < qmin).float()
-        ind_big = (_weights_q > qmax).float()
-        ind_mid = 1. - ind_small - ind_big
-
-        grad_alpha = ((ind_small * qmin + ind_big * qmax + ind_mid * (- _weights_q + _weights_q.round())) * grad_weight).sum().unsqueeze(dim=0)
-        grad_weight = ind_mid * grad_weight
-        return grad_weight, grad_alpha, None, None
-
 class QuantizedWrapper(nn.Module):
-    def __init__(self, module, quant_w=True, quant_x=True, quant_scaler=False, bitwidth_w=16, intbit_w=2, bitwidth_x=16, intbit_x=2):
+    def __init__(self, module, quant_w=True, quant_x=True, bitwidth_w=16, intbit_w=2, bitwidth_x=16, intbit_x=2):
         super().__init__()
         self.module = module  
         self.quant_w = quant_w
         self.quant_x = quant_x
-        self.quant_scaler = quant_scaler
         self.bitwidth_w = bitwidth_w
         self.intbit_w = intbit_w
         self.qstep_w = pow(2, intbit_w) / pow(2, bitwidth_w)
@@ -119,44 +93,27 @@ class QuantizedWrapper(nn.Module):
 
         self.bitwidth_x = bitwidth_x
         self.intbit_x = intbit_x
-        self.qstep_x = pow(2, intbit_x) / pow(2, bitwidth_x) if not quant_scaler else 1
+        self.qstep_x = pow(2, intbit_x) / pow(2, bitwidth_x)
         self.qmax_x = pow(2, intbit_x)/2 - self.qstep_x
         self.qmin_x = -pow(2, intbit_x)/2
         self.full_precision_weight = nn.Parameter(self.module.weight) 
-        self.alpha = nn.Parameter(torch.tensor(1.))
         self.fp = False 
 
     def forward(self, x, fp=False):
         if isinstance(self.module, nn.Linear):
             if not (self.fp or fp):
-                if self.quant_scaler:
-                    quantized_weight = RoundWrapper.apply(self.full_precision_weight, self.alpha, self.qmin_w, self.qmax_w) 
-                else:
-                    quantized_weight = FakeQuantizeSTE.apply(self.full_precision_weight, self.qstep_w, self.qmin_w, self.qmax_w) if self.quant_w else self.full_precision_weight
-                
+                quantized_weight = FakeQuantizeSTE.apply(self.full_precision_weight, self.qstep_w, self.qmin_w, self.qmax_w) if self.quant_w else self.full_precision_weight
                 y = F.linear(x, quantized_weight, self.module.bias)
-
-                if self.quant_scaler:
-                    y = RoundWrapper.apply(y, self.alpha, self.qmin_w, self.qmax_w) 
-                else:
-                    y = FakeQuantizeSTE.apply(y, self.qstep_x, self.qmin_x, self.qmax_x) if self.quant_x else y
+                y = FakeQuantizeSTE.apply(y, self.qstep_x, self.qmin_x, self.qmax_x) if self.quant_x else y
                 return y
             else:
                 return F.linear(x, self.full_precision_weight, self.module.bias)
         elif isinstance(self.module, nn.Conv2d):
             if not (self.fp or fp):
-                if self.quant_scaler:
-                    quantized_weight = RoundWrapper.apply(self.full_precision_weight, self.alpha, self.qmin_w, self.qmax_w) 
-                else:
-                    quantized_weight = FakeQuantizeSTE.apply(self.full_precision_weight, self.qstep_w, self.qmin_w, self.qmax_w) if self.quant_w else self.full_precision_weight
-
+                quantized_weight = FakeQuantizeSTE.apply(self.full_precision_weight, self.qstep_w, self.qmin_w, self.qmax_w) if self.quant_w else self.full_precision_weight
                 y = F.conv2d(x, quantized_weight, self.module.bias, stride=self.module.stride, 
                                 padding=self.module.padding, groups=self.module.groups, dilation=self.module.dilation)
-                
-                if self.quant_scaler:
-                    y = RoundWrapper.apply(y, self.alpha, self.qmin_w, self.qmax_w) 
-                else:
-                    y = FakeQuantizeSTE.apply(y, self.qstep_x, self.qmin_x, self.qmax_x) if self.quant_x else y
+                y = FakeQuantizeSTE.apply(y, self.qstep_x, self.qmin_x, self.qmax_x) if self.quant_x else y
                 return y  
             else:
                 return F.conv2d(x, self.full_precision_weight, self.module.bias, stride=self.module.stride, 
@@ -230,7 +187,6 @@ class ResnetQAT(nn.Module):
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
         x = self.fc(x)
-        return x
 
 def train(model,
             n_epoch = 100,
@@ -240,12 +196,8 @@ def train(model,
             quant_kl = True,
             quant_w = True,
             quant_x = True,
-            quant_scaler = True,
             update_freq = 1,
-            fp_fixed = False,
-            qstep_x=1,
-            qmin_x=0,
-            qmax_x=255
+            fp_fixed = False
 ):
     loss_curve = []
     loss_curve_val = []
@@ -275,12 +227,7 @@ def train(model,
             images_fp, labels = images.to(device), labels.to(device)
             # with torch.no_grad():
             pred_fp = model_target.forward(images_fp, fp = True) if model_target else model.forward(images_fp, fp = True)
-
-            if quant_scaler:
-                images = images_fp
-            else:
-                images = FakeQuantizeSTE.apply(images_fp, qstep_x, qmin_x, qmax_x) if quant_x else images
-
+            images = FakeQuantizeSTE.apply(images_fp, qstep_x, qmin_x, qmax_x) if quant_x else images
             pred = model(images)
             loss_ce_fp = criterion(pred_fp, labels) 
             loss_ce = criterion(pred, labels) 
@@ -308,12 +255,6 @@ def train(model,
             # with torch.no_grad():
             pred_fp = model_target.forward(images_fp, fp = True) if model_target else model.forward(images_fp, fp = True)
             images = FakeQuantizeSTE.apply(images_fp, qstep_x, qmin_x, qmax_x) if quant_x else images
-
-            if quant_scaler:
-                images = images_fp
-            else:
-                images = FakeQuantizeSTE.apply(images_fp, qstep_x, qmin_x, qmax_x) if quant_x else images
-
             pred = model(images)
 
             loss_ce_fp_val = criterion(pred_fp, labels) 
@@ -352,7 +293,7 @@ def train(model,
         acc_curve_fp.append(acc_fp)
         acc_curve_fp_val.append(acc_fp_val)
         
-        start_quant = True if (not fp_fixed) and (acc_fp_val > 0.9) else start_quant
+        start_quant = True if acc_fp_val > 0.9 else start_quant
 
         writer.add_scalar("Loss/train", loss, epoch)
         writer.add_scalar("Loss/val", loss_val, epoch)
@@ -419,13 +360,15 @@ def train_fp(model,
             images, labels = images.to(device), labels.to(device)
             pred = model.forward(images)
             loss = criterion(pred, labels) 
+            writer.add_scalar("Loss/train", loss, epoch)
             loss.backward()
             optimizer.step()
             if args.lr_scheduler:
                 scheduler.step(epoch + batch_i / iters)
 
             pred = torch.argmax(pred, dim=1)
-            acc = torch.mean(pred==labels, dtype=torch.float)
+            acc = torch.tensor(pred==labels, dtype=torch.float).mean()
+            writer.add_scalar("Acc/train", acc, epoch)
             loss_ep.append(loss.item())
             acc_ep.append(acc.item())
 
@@ -435,9 +378,14 @@ def train_fp(model,
             loss_val = criterion(pred, labels)
 
             pred = torch.argmax(pred, dim=1)
-            acc_val = torch.mean(pred==labels, dtype=torch.float)
+            acc_val = torch.tensor(pred==labels, dtype=torch.float).mean()
+            
             loss_ep_val.append(loss_val.item())
             acc_ep_val.append(acc_val.item())
+        
+        for name, param in model.named_parameters():
+            writer.add_scalar(f'{name}/Weights', param.reshape(-1)[0], epoch)
+            writer.add_histogram(f'{name}/Histogram', param, epoch)
         
         loss = sum(loss_ep)/len(train_loader)
         loss_val = sum(loss_ep_val)/len(val_loader)
@@ -446,11 +394,9 @@ def train_fp(model,
         
         writer.add_scalar("Loss/train", loss, epoch)
         writer.add_scalar("Loss/val", loss_val, epoch)
+
         writer.add_scalar("Acc/train", acc, epoch)
         writer.add_scalar("Acc/val", acc_val, epoch)
-        for name, param in model.named_parameters():
-            writer.add_scalar(f'{name}/Weights', param.reshape(-1)[0], epoch)
-            writer.add_histogram(f'{name}/Histogram', param, epoch)
 
         loss_curve.append(loss)
         loss_curve_val.append(loss_val)
@@ -485,10 +431,8 @@ if __name__=="__main__":
     intbit_x = args.intbit_x
     update_freq = args.update_freq
     fp_only = args.fp_only
-    fp_fixed = args.fp_fixed
-    quant_scaler = args.quant_scaler
 
-    qstep_x = pow(2, intbit_x) / pow(2, bitwidth_x) if not quant_scaler else 1
+    qstep_x = pow(2, intbit_x) / pow(2, bitwidth_x)
     qmax_x = pow(2, intbit_x)/2 - qstep_x
     qmin_x = -pow(2, intbit_x)/2
 
@@ -577,8 +521,4 @@ if __name__=="__main__":
               quant_kl=quant_kl,
               quant_w=quant_w,
               quant_x=quant_x,
-              update_freq=update_freq,
-              fp_fixed=fp_fixed,
-              qmax_x=qmax_x,
-              qmin_x=qmin_x,
-              qstep_x=qstep_x)
+              update_freq=update_freq)
