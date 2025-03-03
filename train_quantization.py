@@ -39,8 +39,10 @@ def args_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', default=0)
     parser.add_argument('--model', default='efficientnet', choices=['vgg16', 'mobilenetv3', 'efficientnet', 'resnet18'])
-    parser.add_argument('--load_path', default='', type=str, 
+    parser.add_argument('--load_target', default='', type=str, 
                         choices=['./images/test_training/runs543/epoch50_tacc0.998_vacc0.914.ckp'])
+    parser.add_argument('--load_pretrained', default='', type=str, 
+                        choices=['./images/test_training/runs678/epoch100_tacc0.982_vacc0.860.ckp'])
     parser.add_argument('--myvgg', action='store_true')
     parser.add_argument('--fp_only', action='store_true')
     parser.add_argument('--fp_fixed', default=True,  action='store_true')
@@ -50,9 +52,9 @@ def args_parser():
     parser.add_argument('--quant_w', default=True, action='store_true')
     parser.add_argument('--quant_x', default=True, action='store_true')
     parser.add_argument('--eps', default=0., type=float)
-    parser.add_argument('--bitwidth_w', default=32, type=int)
+    parser.add_argument('--bitwidth_w', default=4, type=int)
     parser.add_argument('--intbit_w', default=2, type=int)
-    parser.add_argument('--bitwidth_x', default=32, type=int)
+    parser.add_argument('--bitwidth_x', default=4, type=int)
     parser.add_argument('--intbit_x', default=6, type=int)
     parser.add_argument('--update_freq', default=1, type=int)
 
@@ -62,7 +64,7 @@ def args_parser():
     parser.add_argument('--n_batch_load', default=1, type=int)
     parser.add_argument('--t_max', default=10, type=int)
     parser.add_argument('--t_step_max', default=2, type=int)
-    parser.add_argument('--print_freq', default=20, type=int)
+    parser.add_argument('--print_freq', default=1, type=int)
     parser.add_argument('--save_freq', default=50, type=int)
     parser.add_argument('--n_epoch', default=100, type=int)
     parser.add_argument('--test', action='store_true')
@@ -83,9 +85,9 @@ class FakeQuantizeSTE(torch.autograd.Function):
 
 class RoundWrapper(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, weights, alpha, qmin, qmax):
+    def forward(ctx, weights, alpha, g, qmin, qmax):
         ctx.save_for_backward(weights, alpha)
-        ctx.other = qmin, qmax
+        ctx.g, ctx.qmin, ctx.qmax = g, qmin, qmax
         _weights_q = (weights/alpha).round().clamp(qmin, qmax)
         weights_q = _weights_q * alpha
         return weights_q
@@ -93,16 +95,16 @@ class RoundWrapper(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_weight):
         weights, alpha = ctx.saved_tensors
-        qmin, qmax = ctx.other
+        g, qmin, qmax = ctx.g, ctx.qmin, ctx.qmax
         _weights_q = weights/alpha
 
         ind_small = (_weights_q < qmin).float()
         ind_big = (_weights_q > qmax).float()
         ind_mid = 1. - ind_small - ind_big
 
-        grad_alpha = ((ind_small * qmin + ind_big * qmax + ind_mid * (- _weights_q + _weights_q.round())) * grad_weight).sum().unsqueeze(dim=0)
+        grad_alpha = ((ind_small * qmin + ind_big * qmax + ind_mid * (- _weights_q + _weights_q.round())) * grad_weight * g).sum().view(1)
         grad_weight = ind_mid * grad_weight
-        return grad_weight, grad_alpha, None, None
+        return grad_weight, grad_alpha, None, None, None
 
 class QuantizedWrapper(nn.Module):
     def __init__(self, module, quant_w=True, quant_x=True, quant_scaler=False, bitwidth_w=16, intbit_w=2, bitwidth_x=16, intbit_x=2):
@@ -113,31 +115,41 @@ class QuantizedWrapper(nn.Module):
         self.quant_scaler = quant_scaler
         self.bitwidth_w = bitwidth_w
         self.intbit_w = intbit_w
-        self.qstep_w = pow(2, intbit_w) / pow(2, bitwidth_w)
-        self.qmax_w = pow(2, intbit_w)/2 - self.qstep_w
-        self.qmin_w = -pow(2, intbit_w)/2
+        self.qstep_w = pow(2, intbit_w) / pow(2, bitwidth_w) if not quant_scaler else 1
+        self.qmax_w = pow(2, intbit_w)/2 - self.qstep_w if not quant_scaler else pow(2, bitwidth_w-1) - 1
+        self.qmin_w = -pow(2, intbit_w)/2 if not quant_scaler else -pow(2, bitwidth_w-1)
 
         self.bitwidth_x = bitwidth_x
         self.intbit_x = intbit_x
         self.qstep_x = pow(2, intbit_x) / pow(2, bitwidth_x) if not quant_scaler else 1
-        self.qmax_x = pow(2, intbit_x)/2 - self.qstep_x
-        self.qmin_x = -pow(2, intbit_x)/2
+        self.qmax_x = pow(2, intbit_x)/2 - self.qstep_x if not quant_scaler else pow(2, bitwidth_x-1) - 1
+        self.qmin_x = -pow(2, intbit_x)/2 if not quant_scaler else -pow(2, bitwidth_x-1)
         self.full_precision_weight = nn.Parameter(self.module.weight) 
-        self.alpha = nn.Parameter(torch.tensor(1.))
+
+        self.alpha_w = nn.Parameter(torch.tensor(2*self.full_precision_weight.abs().mean()/math.sqrt(self.qmax_w)))
+        self.g_w = 1.0 / math.sqrt(self.full_precision_weight.numel() * self.qmax_w)
+        # self.alpha_x = nn.Parameter(torch.tensor(1.))
+        self.alpha_x_initialized = False
+
         self.fp = False 
+
 
     def forward(self, x, fp=False):
         if isinstance(self.module, nn.Linear):
             if not (self.fp or fp):
                 if self.quant_scaler:
-                    quantized_weight = RoundWrapper.apply(self.full_precision_weight, self.alpha, self.qmin_w, self.qmax_w) 
+                    quantized_weight = RoundWrapper.apply(self.full_precision_weight, self.alpha_w, self.g_w, self.qmin_w, self.qmax_w) 
                 else:
                     quantized_weight = FakeQuantizeSTE.apply(self.full_precision_weight, self.qstep_w, self.qmin_w, self.qmax_w) if self.quant_w else self.full_precision_weight
                 
                 y = F.linear(x, quantized_weight, self.module.bias)
 
                 if self.quant_scaler:
-                    y = RoundWrapper.apply(y, self.alpha, self.qmin_w, self.qmax_w) 
+                    if not self.alpha_x_initialized:
+                        self.alpha_x = nn.Parameter(torch.tensor(2*y.abs().mean()/math.sqrt(self.qmax_x)))
+                        self.alpha_x_initialized = True
+
+                    y = RoundWrapper.apply(y, self.alpha_x, 1.0/math.sqrt(y.numel() * self.qmax_x), self.qmin_x, self.qmax_x) 
                 else:
                     y = FakeQuantizeSTE.apply(y, self.qstep_x, self.qmin_x, self.qmax_x) if self.quant_x else y
                 return y
@@ -146,7 +158,7 @@ class QuantizedWrapper(nn.Module):
         elif isinstance(self.module, nn.Conv2d):
             if not (self.fp or fp):
                 if self.quant_scaler:
-                    quantized_weight = RoundWrapper.apply(self.full_precision_weight, self.alpha, self.qmin_w, self.qmax_w) 
+                    quantized_weight = RoundWrapper.apply(self.full_precision_weight, self.alpha_w, self.g_w, self.qmin_w, self.qmax_w) 
                 else:
                     quantized_weight = FakeQuantizeSTE.apply(self.full_precision_weight, self.qstep_w, self.qmin_w, self.qmax_w) if self.quant_w else self.full_precision_weight
 
@@ -154,7 +166,11 @@ class QuantizedWrapper(nn.Module):
                                 padding=self.module.padding, groups=self.module.groups, dilation=self.module.dilation)
                 
                 if self.quant_scaler:
-                    y = RoundWrapper.apply(y, self.alpha, self.qmin_w, self.qmax_w) 
+                    if not self.alpha_x_initialized:
+                        self.alpha_x = nn.Parameter(torch.tensor(2*y.abs().mean()/math.sqrt(self.qmax_x)))
+                        self.alpha_x_initialized = True
+
+                    y = RoundWrapper.apply(y, self.alpha_x, 1.0/math.sqrt(y.numel() * self.qmax_x), self.qmin_x, self.qmax_x) 
                 else:
                     y = FakeQuantizeSTE.apply(y, self.qstep_x, self.qmin_x, self.qmax_x) if self.quant_x else y
                 return y  
@@ -164,12 +180,12 @@ class QuantizedWrapper(nn.Module):
         else:
             raise TypeError("Unsupported layer type for QAT")
 
-def apply_quantization(model, quant_w=True, quant_x=True, bitwidth_w=16, intbit_w=2, bitwidth_x=16, intbit_x=2):
+def apply_quantization(model, quant_w=True, quant_x=True, quant_scaler=False, bitwidth_w=16, intbit_w=2, bitwidth_x=16, intbit_x=2):
     for name, module in model.named_children():
         if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
-            setattr(model, name, QuantizedWrapper(module, quant_w, quant_x, bitwidth_w, intbit_w, bitwidth_x, intbit_x))  
+            setattr(model, name, QuantizedWrapper(module, quant_w, quant_x, quant_scaler, bitwidth_w, intbit_w, bitwidth_x, intbit_x))  
         else:
-            apply_quantization(module, quant_w, quant_x, bitwidth_w, intbit_w, bitwidth_x, intbit_x) 
+            apply_quantization(module, quant_w, quant_x, quant_scaler, bitwidth_w, intbit_w, bitwidth_x, intbit_x) 
     return model
 
 def kl_loss(output_quantized, output_full_precision):
@@ -301,6 +317,10 @@ def train(model,
             pred_fp = torch.argmax(pred_fp, dim=1)
             acc_fp = torch.mean(pred_fp==labels, dtype=torch.float)
             acc_ep_fp.append(acc_fp.item())
+
+            # for name, param in model.named_parameters():
+            #     if name.split('.')[-1] == 'alpha_w' or name.split('.')[-1] == 'alpha_x':
+            #         print(f'name: {name}, param: {param}')
 
         
         for batch_i, (images, labels) in enumerate(val_loader):
@@ -523,39 +543,41 @@ if __name__=="__main__":
                                         download=True, transform=transform_test)
     val_loader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
                                                 shuffle=False, num_workers=2)
-
-    if mod == 'vgg16':
-        model = torchvision.models.vgg16(weights = 'DEFAULT')
-        model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, 10)
-        model = model.to(device)
-    elif mod == 'mobilenetv3':
-        model = torchvision.models.mobilenet_v3_large(weights = 'DEFAULT')
-        model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, 10)
-        model = model.to(device)
-    elif mod == 'efficientnet':
-        model = torchvision.models.efficientnet_b0(weights = 'DEFAULT')
-        model.classifier[1] = nn.Linear(model.classifier[1].in_features, 10)
-        model = model.to(device)
-        if quant_w or quant_x:
-            model = apply_quantization(model, quant_w=quant_w, quant_x=quant_x, bitwidth_w=bitwidth_w, 
-                                       intbit_w=intbit_w, bitwidth_x=bitwidth_x, intbit_x=intbit_x)
+    if args.load_pretrained != '':
+        model = torch.load(args.load_pretrained, map_location=device)
+    else:  
+        if mod == 'vgg16':
+            model = torchvision.models.vgg16(weights = 'DEFAULT')
+            model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, 10)
+            model = model.to(device)
+        elif mod == 'mobilenetv3':
+            model = torchvision.models.mobilenet_v3_large(weights = 'DEFAULT')
+            model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, 10)
+            model = model.to(device)
+        elif mod == 'efficientnet':
+            model = torchvision.models.efficientnet_b0(weights = 'DEFAULT') 
+            model.classifier[1] = nn.Linear(model.classifier[1].in_features, 10)
+            model = model.to(device)
+            if quant_w or quant_x:
+                model = apply_quantization(model, quant_w=quant_w, quant_x=quant_x, quant_scaler=quant_scaler, bitwidth_w=bitwidth_w, 
+                                        intbit_w=intbit_w, bitwidth_x=bitwidth_x, intbit_x=intbit_x)
             
-        model = EfficientnetQAT(model=model)
-        if fp_only:
-            for module in model.modules():
-                if isinstance(module, QuantizedWrapper):
-                    module.fp = True
-    
-    elif mod == 'resnet18':
-        model = torchvision.models.resnet18(weights = 'DEFAULT')
-        model.fc = nn.Linear(model.fc.in_features, 10)
-        model = model.to(device)
-        if quant_w or quant_x:
-            model = apply_quantization(model, quant_w=quant_w, quant_x=quant_x, bitwidth_w=bitwidth_w, 
-                                       intbit_w=intbit_w, bitwidth_x=bitwidth_x, intbit_x=intbit_x)
-        model = ResnetQAT(model=model)      
+            model = EfficientnetQAT(model=model)
+            if fp_only:
+                for module in model.modules():
+                    if isinstance(module, QuantizedWrapper):
+                        module.fp = True
+        
+        elif mod == 'resnet18':
+            model = torchvision.models.resnet18(weights = 'DEFAULT')
+            model.fc = nn.Linear(model.fc.in_features, 10)
+            model = model.to(device)
+            if quant_w or quant_x:
+                model = apply_quantization(model, quant_w=quant_w, quant_x=quant_x, bitwidth_w=bitwidth_w, 
+                                        intbit_w=intbit_w, bitwidth_x=bitwidth_x, intbit_x=intbit_x)
+            model = ResnetQAT(model=model)      
 
-    model_target = torch.load(args.load_path, map_location=device) if args.load_path != '' else None
+    model_target = torch.load(args.load_target, map_location=device) if args.load_target != '' else None
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=args.weight_decay)
     if args.lr_scheduler:
         scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer=optimizer, T_0=1, T_mult=1)
