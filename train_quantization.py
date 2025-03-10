@@ -50,6 +50,7 @@ def args_parser():
     parser.add_argument('--fp_fixed', default=True, action='store_true')
     parser.add_argument('--noKL', action='store_true')
     parser.add_argument('--load_target_csd', action='store_true')
+    parser.add_argument('--_1st_1last', default=True, action='store_true')
 
     parser.add_argument('--alpha_init', default=2, type=float)
     parser.add_argument('--quant_scaler', default=True, action='store_true')
@@ -616,11 +617,23 @@ if __name__=="__main__":
             model = torchvision.models.efficientnet_b0(weights = 'DEFAULT') 
             model.classifier[1] = nn.Linear(model.classifier[1].in_features, 10)
             model = model.to(device)
-            # ms = list(model.children())
             if quant_w or quant_x:
                 model = apply_quantization(model, quant_w=quant_w, quant_x=quant_x, quant_scaler=quant_scaler, bitwidth_w=bitwidth_w, 
                                         intbit_w=intbit_w, bitwidth_x=bitwidth_x, intbit_x=intbit_x, alpha_init=alpha_init)
             
+            if args._1st_1last:
+                for layer in model.modules():
+                    if isinstance(layer, QuantizedWrapper):
+                        layer.bitwidth_w = 8
+                        layer.bitwidth_x = 8
+                        break
+                last_layer = None
+                for layer in model.modules():
+                    if isinstance(layer, QuantizedWrapper):
+                        last_layer = layer
+                last_layer.bitwidth_w = 8
+                last_layer.bitwidth_x = 8
+
             model = EfficientnetQAT(model=model)
             if fp_only:
                 for module in model.modules():
