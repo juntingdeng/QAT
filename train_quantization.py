@@ -50,7 +50,7 @@ def args_parser():
     parser.add_argument('--fp_fixed', default=True, action='store_true')
     parser.add_argument('--noKL', action='store_true')
     parser.add_argument('--load_target_csd', action='store_true')
-    parser.add_argument('--_1st_1last', default=True, action='store_true')
+    parser.add_argument('--_1st_1last', action='store_true')
 
     parser.add_argument('--alpha_init', default=2, type=float)
     parser.add_argument('--quant_scaler', default=True, action='store_true')
@@ -107,9 +107,9 @@ class RoundWrapper(torch.autograd.Function):
         ind_big = (_weights_q > qmax).float()
         ind_mid = 1. - ind_small - ind_big
 
-        grad_alpha = ((ind_small * qmin + ind_big * qmax + ind_mid * (- _weights_q + _weights_q.round())) * grad_weight * g).sum().view(1)
+        grad_alpha = ((ind_small * qmin + ind_big * qmax + ind_mid * (- _weights_q + _weights_q.round())) * grad_weight * g).mean().view(1)
         grad_weight = ind_mid * grad_weight
-        grad_beta = (ind_mid * 0 + ind_big + ind_small).sum().view(1)
+        grad_beta = ((ind_mid * 0 + ind_big + ind_small)* grad_weight * g).mean().view(1)
         return grad_weight, grad_alpha, grad_beta, None, None, None
 
 class QuantizedWrapper(nn.Module):
