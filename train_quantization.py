@@ -39,8 +39,9 @@ def init_seeds(seed=0, deterministic=False):
 def args_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', default=0)
-    parser.add_argument('--model', default='efficientnet', choices=['vgg16', 'mobilenetv3', 'efficientnet', 'resnet18'])
-    parser.add_argument('--load_target', default='./images/test_training/runs543/epoch50_tacc0.998_vacc0.914.ckp', type=str, 
+    parser.add_argument('--trainingQAT', action='store_true')
+    parser.add_argument('--model', default='resnet18', choices=['vgg16', 'mobilenetv3', 'efficientnet', 'resnet18'])
+    parser.add_argument('--load_target', type=str, 
                         choices=['./images/test_training/runs543/epoch50_tacc0.998_vacc0.914.ckp',
                                  './images/test_training/runs677/epoch100_tacc0.996_vacc0.926.ckp'])
     parser.add_argument('--load_pretrained', default='', type=str,)
@@ -48,15 +49,15 @@ def args_parser():
                         #          './images/test_training/runs748/epoch500_tacc0.995_vacc0.718.ckp'])
     parser.add_argument('--myvgg', action='store_true')
     parser.add_argument('--fp_only', action='store_true')
-    parser.add_argument('--fp_fixed', default=True, action='store_true')
+    parser.add_argument('--fp_fixed', action='store_true')
     parser.add_argument('--noKL', action='store_true')
-    parser.add_argument('--load_target_csd', default=True, action='store_true')
+    parser.add_argument('--load_target_csd', action='store_true')
     parser.add_argument('--_1st_1last', action='store_true')
 
     parser.add_argument('--alpha_init', default=2, type=float)
-    parser.add_argument('--quant_scaler', default=True, action='store_true')
-    parser.add_argument('--quant_w', default=True, action='store_true')
-    parser.add_argument('--quant_x', default=True, action='store_true')
+    parser.add_argument('--quant_scaler',  action='store_true')
+    parser.add_argument('--quant_w', action='store_true')
+    parser.add_argument('--quant_x', action='store_true')
     parser.add_argument('--eps', default=0., type=float)
     parser.add_argument('--bitwidth_w', default=4, type=int)
     parser.add_argument('--intbit_w', default=2, type=int)
@@ -81,7 +82,7 @@ def args_parser():
 
 activation_in = {}
 activation_out = {}
-def get_activation(name):
+def get_activation(name, activation_in, activation_out):
     def hook(model, input, output):
         input_tuple = tuple(input) 
         activation_in[name] = input_tuple[0] if isinstance(input_tuple, tuple) and len(input_tuple) == 1 \
@@ -226,16 +227,18 @@ class QuantizedWrapper(nn.Module):
             return y  
 
 
-def apply_quantization(model, pre_name = '', quant_w=True, quant_x=True, quant_scaler=False, bitwidth_w=16, intbit_w=2, bitwidth_x=16, intbit_x=2, alpha_init=None):
+def apply_quantization(model, pre_name = '', quant_w=True, quant_x=True, quant_scaler=False, 
+                       bitwidth_w=16, intbit_w=2, bitwidth_x=16, intbit_x=2, alpha_init=None, activation_in=None, activation_out=None):
     for name, module in model.named_children():
         cur_name = pre_name+'.'+name if pre_name != '' else name
         if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
             wrapper = QuantizedWrapper(module, quant_w, quant_x, quant_scaler, bitwidth_w, intbit_w, bitwidth_x, intbit_x, alpha_init=alpha_init)
-            wrapper.register_forward_hook(get_activation(name=cur_name))
+            wrapper.register_forward_hook(get_activation(name=cur_name, activation_in=activation_in, activation_out=activation_out))
             setattr(model, name, wrapper)  
             
         else:
-            apply_quantization(module, cur_name, quant_w, quant_x, quant_scaler, bitwidth_w, intbit_w, bitwidth_x, intbit_x, alpha_init=alpha_init) 
+            apply_quantization(module, cur_name, quant_w, quant_x, quant_scaler, bitwidth_w, intbit_w, bitwidth_x, intbit_x, 
+                               alpha_init=alpha_init, activation_in=activation_in, activation_out=activation_out) 
     return model
 
 def kl_loss(output_quantized, output_full_precision):
@@ -300,7 +303,12 @@ class ResnetQAT(nn.Module):
         return x
     
 def train(model,
+          train_loader,
+          val_loader,
           model_target,
+            criterion,
+            optimizer,
+            lr_scheduler = None,
             n_epoch = 100,
             save_ckp = True,
             save_freq = 50,
@@ -361,8 +369,8 @@ def train(model,
 
             loss.backward()
             optimizer.step()
-            if args.lr_scheduler:
-                scheduler.step()
+            if lr_scheduler:
+                lr_scheduler.step()
 
             pred = torch.argmax(pred, dim=1)
             acc = torch.mean(pred==labels, dtype=torch.float)
@@ -412,7 +420,7 @@ def train(model,
             writer.add_histogram(f'{name}/Val/Input', input, epoch)
         for name, output in activation_out.items():
             writer.add_histogram(f'{name}/Val/Output', output, epoch)
-        
+
         loss = sum(loss_ep)/len(train_loader)
         loss_val = sum(loss_ep_val)/len(val_loader)
         loss_kl = sum(loss_kl_ep)/len(train_loader)
@@ -497,6 +505,11 @@ def train(model,
     # np.save(save_path+'grad_states.npy', grad_states)
 
 def train_fp(model,
+            train_loader,
+            val_loader,
+            criterion,
+            optimizer,
+            lr_scheduler = None,
             n_epoch = 100,
             save_ckp = True,
             save_freq = 50,
@@ -508,6 +521,7 @@ def train_fp(model,
     acc_curve_val = []
     start = time.time()
     iters = len(train_loader)
+    best_acc_val = 0
     for epoch in range(n_epoch):
         loss_ep = []
         loss_ep_val = []
@@ -517,12 +531,12 @@ def train_fp(model,
         for batch_i, (images, labels) in enumerate(train_loader):
             optimizer.zero_grad()
             images, labels = images.to(device), labels.to(device)
-            pred = model.forward(images)
+            pred = model.forward(images, fp = True)
             loss = criterion(pred, labels) 
             loss.backward()
             optimizer.step()
-            if args.lr_scheduler:
-                scheduler.step()
+            if lr_scheduler:
+                lr_scheduler.step()
 
             pred = torch.argmax(pred, dim=1)
             acc = torch.mean(pred==labels, dtype=torch.float)
@@ -531,14 +545,14 @@ def train_fp(model,
 
         for batch_i, (images, labels) in enumerate(val_loader):
             images, labels = images.to(device), labels.to(device)
-            pred = model(images)
+            pred = model.forward(images, fp = True)
             loss_val = criterion(pred, labels)
 
             pred = torch.argmax(pred, dim=1)
             acc_val = torch.mean(pred==labels, dtype=torch.float)
             loss_ep_val.append(loss_val.item())
             acc_ep_val.append(acc_val.item())
-        
+
         loss = sum(loss_ep)/len(train_loader)
         loss_val = sum(loss_ep_val)/len(val_loader)
         acc = sum(acc_ep)/len(train_loader)
@@ -549,7 +563,6 @@ def train_fp(model,
         writer.add_scalar("Acc/train", acc, epoch)
         writer.add_scalar("Acc/val", acc_val, epoch)
         for name, param in model.named_parameters():
-            writer.add_scalar(f'{name}/Weights', param.reshape(-1)[0], epoch)
             writer.add_histogram(f'{name}/Histogram', param, epoch)
 
         loss_curve.append(loss)
@@ -560,8 +573,14 @@ def train_fp(model,
         if (epoch+1)%print_freq==0:
             print(f'epoch:{epoch+1}, time:{(time.time() - start):.2f}, loss:{loss:.4f}, acc:{acc:.4f}, loss_val:{loss_val:.4f}, acc_val:{acc_val:.4f}')
 
+        if acc_val >= best_acc_val:
+            best_acc_val = acc_val
+            best_acc = acc
+            best_model = {'model': model,
+                          'acc': best_acc_val}
+            
         if save_ckp and (epoch+1)%save_freq==0:
-            torch.save(model, save_path+f'epoch{epoch+1}_tacc{acc:.3f}_vacc{acc_val:.3f}.ckp')
+            torch.save(best_model, save_path+f'epoch{epoch+1}_tacc{best_acc:.3f}_vacc{best_acc_val:.3f}.ckp', pickle_module=dill)
 
 def csd_intersect(csd_model, csd_target, load_target):
     keys_model = csd_model.keys()
@@ -582,6 +601,18 @@ if __name__=="__main__":
     args = args_parser()
     seed = args.seed
     init_seeds(seed=seed)
+    if not args.trainingQAT and not args.fp_only:
+        args.fp_fixed = True
+        args.load_target_csd = True
+        args.quant_scaler = True
+        args.quant_w = True
+        args.quant_x = True
+        args.bitwidth_w = 4
+        args.bitwidth_x = 4
+        args.alpha_init = 2
+        args.batch_size = 128
+        args.lr = 1e-3
+
     test = args.test
     n_epoch = args.n_epoch
     lr=args.lr
@@ -604,6 +635,7 @@ if __name__=="__main__":
     KL = not args.noKL
     alpha_init = args.alpha_init
 
+
     qstep_x = pow(2, intbit_x) / pow(2, bitwidth_x) if not quant_scaler else 1
     qmax_x = pow(2, intbit_x)/2 - qstep_x
     qmin_x = -pow(2, intbit_x)/2
@@ -613,24 +645,24 @@ if __name__=="__main__":
         writer = SummaryWriter(save_path)
     
         
-    h, w, ch, n_cls, k = 32, 32, 3, 10, args.k
+    h, w, ch, n_cls = 32, 32, 3, 10
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     transform_train = transforms.Compose([
-        transforms.Resize(256, interpolation=InterpolationMode.BICUBIC),
+        transforms.Resize(256, interpolation=InterpolationMode.BILINEAR), #Efficientnet: BICUBIC, Resnet: BILINEAR
         transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
 
     transform_test = transforms.Compose([
-        transforms.Resize(256, interpolation=InterpolationMode.BICUBIC),
+        transforms.Resize(256, interpolation=InterpolationMode.BILINEAR),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
 
-    CIFAR10.train_list = CIFAR10.train_list[: n_batch_load]
+    # CIFAR10.train_list = CIFAR10.train_list[: n_batch_load]
     trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
                                             download=True, transform=transform_train)
     train_loader = torch.utils.data.DataLoader(trainset, batch_size=batch_size,
@@ -657,37 +689,39 @@ if __name__=="__main__":
             model = model.to(device)
             if quant_w or quant_x:
                 model = apply_quantization(model, quant_w=quant_w, quant_x=quant_x, quant_scaler=quant_scaler, bitwidth_w=bitwidth_w, 
-                                        intbit_w=intbit_w, bitwidth_x=bitwidth_x, intbit_x=intbit_x, alpha_init=alpha_init)
-            
-            if args._1st_1last:
-                for layer in model.modules():
-                    if isinstance(layer, QuantizedWrapper):
-                        layer.bitwidth_w = 8
-                        layer.bitwidth_x = 8
-                        break
-                last_layer = None
-                for layer in model.modules():
-                    if isinstance(layer, QuantizedWrapper):
-                        last_layer = layer
-                last_layer.bitwidth_w = 8
-                last_layer.bitwidth_x = 8
-
+                                        intbit_w=intbit_w, bitwidth_x=bitwidth_x, intbit_x=intbit_x, alpha_init=alpha_init,
+                                        activation_in=activation_in, activation_out=activation_out)
             model = EfficientnetQAT(model=model)
-            if fp_only:
-                for module in model.modules():
-                    if isinstance(module, QuantizedWrapper):
-                        module.fp = True
         
         elif mod == 'resnet18':
             model = torchvision.models.resnet18(weights = 'DEFAULT')
             model.fc = nn.Linear(model.fc.in_features, 10)
             model = model.to(device)
-            if quant_w or quant_x:
-                model = apply_quantization(model, quant_w=quant_w, quant_x=quant_x, bitwidth_w=bitwidth_w, 
-                                        intbit_w=intbit_w, bitwidth_x=bitwidth_x, intbit_x=intbit_x, alpha_init=alpha_init)
+            # if quant_w or quant_x:
+            model = apply_quantization(model, quant_w=quant_w, quant_x=quant_x, quant_scaler=quant_scaler, bitwidth_w=bitwidth_w, 
+                                        intbit_w=intbit_w, bitwidth_x=bitwidth_x, intbit_x=intbit_x, alpha_init=alpha_init,
+                                        activation_in=activation_in, activation_out=activation_out)
             model = ResnetQAT(model=model)      
 
-    model_target = torch.load(args.load_target, map_location=device) if args.load_target != '' else None
+        if args._1st_1last:
+            for layer in model.modules():
+                if isinstance(layer, QuantizedWrapper):
+                    layer.bitwidth_w = 8
+                    layer.bitwidth_x = 8
+                    break
+            last_layer = None
+            for layer in model.modules():
+                if isinstance(layer, QuantizedWrapper):
+                    last_layer = layer
+            last_layer.bitwidth_w = 8
+            last_layer.bitwidth_x = 8
+        
+        if fp_only:
+            for module in model.modules():
+                if isinstance(module, QuantizedWrapper):
+                    module.fp = True
+
+    model_target = torch.load(args.load_target, map_location=device) if args.load_target != None else None
     if args.load_target_csd and not args.load_pretrained:
         csd_target = model_target.state_dict()
         csd_model = model.state_dict()
@@ -695,13 +729,18 @@ if __name__=="__main__":
         model.load_state_dict(csd_model)
 
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=args.weight_decay)
-    if args.lr_scheduler:
-        # scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer=optimizer, T_0=1, T_mult=1)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=n_epoch, eta_min=1e-4)
+    
+    # scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer=optimizer, T_0=1, T_mult=1)
+    lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=200) if args.lr_scheduler else None
     criterion = nn.CrossEntropyLoss()
 
     if fp_only:
         train_fp(model = model,
+                 train_loader=train_loader,
+                 val_loader=val_loader,
+                 criterion=criterion,
+                 optimizer=optimizer,
+                 lr_scheduler=lr_scheduler,
                 n_epoch=n_epoch,
                 save_ckp=save_ckp,
                 save_freq=save_freq,
@@ -709,7 +748,12 @@ if __name__=="__main__":
 
     else:
         train(model=model,
+              train_loader=train_loader,
+              val_loader=val_loader,
               model_target=model_target,
+              criterion=criterion,
+              optimizer=optimizer,
+              lr_scheduler=lr_scheduler,
               n_epoch=n_epoch,
               save_ckp=save_ckp,
               save_freq=save_freq,
