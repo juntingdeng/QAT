@@ -4,15 +4,23 @@ import torchvision
 import torchvision.transforms as transforms
 from torchvision.transforms.functional import InterpolationMode
 import numpy as np
+import torch.nn as nn
 import matplotlib.pyplot as plt
 from quantization import quantizearray
-from train_quantization import EfficientnetQAT, RoundWrapper, QuantizedWrapper, FakeQuantizeSTE
+from train_quantization import QuantizedWrapper, RoundWrapper
 import argparse
+from torch.utils.tensorboard import SummaryWriter
+import dill
 
 def args_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--quantw', action='store_true')
     parser.add_argument('--quantx', action='store_true')
+    parser.add_argument('--inference', action='store_true')
+    parser.add_argument('--data_statistic', action='store_true')
+    parser.add_argument('--weight_statistic', default=True, action='store_true')
+    parser.add_argument('--save_path', type=str)
+
     parser.add_argument('--bitwidth_w', default=4, type=int)
     parser.add_argument('--intbit_w', default=2, type=int)
     parser.add_argument('--bitwidth_x', default=4, type=int)
@@ -24,7 +32,11 @@ if __name__ == "__main__":
     args = args_parser()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = torch.load('./images/test_training/runs679/epoch500_tacc0.998_vacc0.900.ckp', map_location=device)
+    model = torch.load('./images/test_training/runs792/epoch150_tacc0.992_vacc0.835.ckp', map_location=device, pickle_module=dill)
+    model = model['model'] if isinstance(model, dict) else model
+    data_statistic = args.data_statistic
+    inference = args.inference
+    weight_statistic = args.weight_statistic
 
     bitwidth_x = args.bitwidth_x
     intbit_x = args.intbit_x
@@ -68,35 +80,55 @@ if __name__ == "__main__":
     testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
     testloader = torch.utils.data.DataLoader(testset, batch_size=256, shuffle=False, num_workers=2)
 
-    acc_ep_val = []
+    if data_statistic:
+        avg_w = []
+        avg_w2 = []
+        std = []
+        xmin, xmax = 10000, -10000
+        print(f'len.trainloader: {len(list(trainloader))}') #len.trainloader: 196
+        for batch_i, (images, labels) in enumerate(trainloader):
+            images, labels = images.to(device), labels.to(device)
+            images = images.reshape(images.shape[0], -1)
 
-    avg_w = []
-    avg_w2 = []
-    std = []
+            avg_w.append(images.mean())
+            avg_w2.append(torch.square(images).mean())
+            std.append(images.std(dim=1).mean())
+            xmin = min(xmin, images.min())
+            xmax = max(xmax, images.max())
 
-    for batch_i, (images, labels) in enumerate(trainloader):
-        images, labels = images.to(device), labels.to(device)
-        images = images.reshape(images.shape[0], -1)
+        for batch_i, (images, labels) in enumerate(testloader):
+            images, labels = images.to(device), labels.to(device)
+            avg_w.append(images.mean())
+            avg_w2.append(torch.square(images).mean())
+            std.append(images.std(dim=1).mean())
+            xmin = min(xmin, images.min())
+            xmax = max(xmax, images.max())
 
-        avg_w.append(images.mean())
-        avg_w2.append(torch.square(images).mean())
-        std.append(images.std(dim=1).mean())
-
-    for batch_i, (images, labels) in enumerate(testloader):
-        images, labels = images.to(device), labels.to(device)
-        avg_w.append(images.mean())
-        avg_w2.append(torch.square(images).mean())
-        std.append(images.std(dim=1).mean())
-
-    print(f'E[w]: {sum(avg_w)/len(avg_w)}, E[w^2]: {sum(avg_w2)/len(avg_w2)}, std: {sum(std)/len(std)}')
+        print(f'Range: {xmin} ~ {xmax}, E[w]: {sum(avg_w)/len(avg_w)}, E[w^2]: {sum(avg_w2)/len(avg_w2)}, std: {sum(std)/len(std)}')
     
-    #     pred = model(images)
-    #     pred = torch.argmax(pred, dim=1)
-    #     acc_val = torch.mean(pred==labels, dtype=torch.float)
-    #     acc_ep_val.append(acc_val.item())
+    if inference:
+        acc_ep_val = []
+        for batch_i, (images, labels) in enumerate(trainloader):
+            pred = model(images)
+            pred = torch.argmax(pred, dim=1)
+            acc_val = torch.mean(pred==labels, dtype=torch.float)
+            acc_ep_val.append(acc_val.item())
+        print(f'acc: {sum(acc_ep_val)/len(acc_ep_val)}')
+    
+    if weight_statistic:
+        writer = SummaryWriter(args.save_path)
+        for module in model.modules():
+            print(type(module).__module__)
+            print(type(module).__name__)
+            if isinstance(module, QuantizedWrapper):
+                fp_weight = module.full_precision_weight
+                qt_weight = RoundWrapper.apply(module.full_precision_weight, module.alpha_w, 
+                                               module.beta_w, module.g_w, module.qmin_w, module.qmax_w) 
 
-    # if args.quantw:
-    #     print(f'quantw, bitwidth_w: {bitwidth_w}, intbit_w: {intbit_w}')
-    # if args.quantx:
-    #     print(f'quantx, bitwidth_x: {bitwidth_x}, intbit_x: {intbit_x}')
-    # print(f'acc: {sum(acc_ep_val)/len(acc_ep_val)}')
+                writer.add_histogram(f'{name}/FP.Hist', param.data)
+                writer.add_histogram(f'{name}/QT.Hist', param.grad)
+
+    if args.quantw:
+        print(f'quantw, bitwidth_w: {bitwidth_w}, intbit_w: {intbit_w}')
+    if args.quantx:
+        print(f'quantx, bitwidth_x: {bitwidth_x}, intbit_x: {intbit_x}')

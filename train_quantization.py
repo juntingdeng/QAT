@@ -23,8 +23,9 @@ from torchvision.models import EfficientNet
 from torchvision.ops.misc import SqueezeExcitation, Conv2dNormActivation
 from torch.nn.modules.container import Sequential
 import copy
+import dill
 
-from quantization import quantizearray
+from quantization import *
 
 def init_seeds(seed=0, deterministic=False):
     # Initialize random number generator (RNG) seeds https://pytorch.org/docs/stable/notes/randomness.html
@@ -42,14 +43,14 @@ def args_parser():
     parser.add_argument('--load_target', default='./images/test_training/runs543/epoch50_tacc0.998_vacc0.914.ckp', type=str, 
                         choices=['./images/test_training/runs543/epoch50_tacc0.998_vacc0.914.ckp',
                                  './images/test_training/runs677/epoch100_tacc0.996_vacc0.926.ckp'])
-    parser.add_argument('--load_pretrained', default='', type=str, 
-                        choices=['./images/test_training/runs678/epoch100_tacc0.982_vacc0.860.ckp',
-                                 './images/test_training/runs748/epoch500_tacc0.995_vacc0.718.ckp'])
+    parser.add_argument('--load_pretrained', default='', type=str,)
+                        # choices=['./images/test_training/runs678/epoch100_tacc0.982_vacc0.860.ckp',
+                        #          './images/test_training/runs748/epoch500_tacc0.995_vacc0.718.ckp'])
     parser.add_argument('--myvgg', action='store_true')
     parser.add_argument('--fp_only', action='store_true')
     parser.add_argument('--fp_fixed', default=True, action='store_true')
     parser.add_argument('--noKL', action='store_true')
-    parser.add_argument('--load_target_csd', action='store_true')
+    parser.add_argument('--load_target_csd', default=True, action='store_true')
     parser.add_argument('--_1st_1last', action='store_true')
 
     parser.add_argument('--alpha_init', default=2, type=float)
@@ -63,7 +64,7 @@ def args_parser():
     parser.add_argument('--intbit_x', default=6, type=int)
     parser.add_argument('--update_freq', default=1, type=int)
 
-    parser.add_argument('--lr', default=1e-4, type=float)
+    parser.add_argument('--lr', default=1e-3, type=float)
     parser.add_argument('--k', default=3, type=int)
     parser.add_argument('--batch_size', default=128, type=int)
     parser.add_argument('--n_batch_load', default=1, type=int)
@@ -77,7 +78,17 @@ def args_parser():
     parser.add_argument('--weight_decay', default=0, type=float)
     parser.add_argument('--lr_scheduler', action='store_true')
     return parser.parse_args()
-       
+
+activation_in = {}
+activation_out = {}
+def get_activation(name):
+    def hook(model, input, output):
+        input_tuple = tuple(input) 
+        activation_in[name] = input_tuple[0] if isinstance(input_tuple, tuple) and len(input_tuple) == 1 \
+                else (x.detach() for x in input_tuple)
+        activation_out[name] = output.detach()
+    return hook
+
 class FakeQuantizeSTE(torch.autograd.Function):
     @staticmethod
     def forward(self, weights, step, min_val, max_val):
@@ -107,9 +118,9 @@ class RoundWrapper(torch.autograd.Function):
         ind_big = (_weights_q > qmax).float()
         ind_mid = 1. - ind_small - ind_big
 
-        grad_alpha = ((ind_small * qmin + ind_big * qmax + ind_mid * (- _weights_q + _weights_q.round())) * grad_weight * g).mean().view(1)
+        grad_alpha = ((ind_small * qmin + ind_big * qmax + ind_mid * (- _weights_q + _weights_q.round())) * grad_weight * g).sum().view(1)
         grad_weight = ind_mid * grad_weight
-        grad_beta = ((ind_mid * 0 + ind_big + ind_small)* grad_weight * g).mean().view(1)
+        grad_beta = ((ind_mid * 0 + ind_big + ind_small)* grad_weight * g).sum().view(1)
         return grad_weight, grad_alpha, grad_beta, None, None, None
 
 class QuantizedWrapper(nn.Module):
@@ -132,6 +143,7 @@ class QuantizedWrapper(nn.Module):
         self.qmax_x = pow(2, intbit_x)/2 - self.qstep_x if not quant_scaler else pow(2, bitwidth_x-1) - 1
         self.qmin_x = -pow(2, intbit_x)/2 if not quant_scaler else -pow(2, bitwidth_x-1)
         self.full_precision_weight = nn.Parameter(self.module.weight) 
+        self.quantized_weight = None
 
         self.fp = False 
         self.alpha_x_initialized = False
@@ -145,10 +157,13 @@ class QuantizedWrapper(nn.Module):
             # Dataset[train, val]: E[w]=0.08617200702428818, E[w^2]=1.1822057962417603, std=0.8140683770179749
             mu_w, sigma_w = self.full_precision_weight.mean(), self.full_precision_weight.std()
             mu_x, sigma_x = 0.08617200702428818, 0.8140683770179749
+            min_x, max_x = -2.1179039478302, 2.640000104904175
             self.beta_w = nn.Parameter(torch.tensor(mu_w))
-            self.beta_x = nn.Parameter(torch.tensor(mu_x))
+            # self.beta_x = nn.Parameter(torch.tensor(mu_x))
             self.alpha_w = nn.Parameter(torch.tensor(max(abs(mu_w-3*sigma_w), abs(mu_w+3*sigma_w))/self.qmax_w))
-            self.alpha_x = nn.Parameter(torch.tensor(max(abs(mu_x-3*sigma_x), abs(mu_x+3*sigma_x))/self.qmax_x))
+            # self.alpha_x = nn.Parameter(torch.tensor(max(abs(mu_x-3*sigma_x), abs(mu_x+3*sigma_x))/self.qmax_x))
+            self.alpha_x = nn.Parameter(torch.tensor((max_x - min_x)/(self.qmax_x - self.qmin_x)))
+            self.beta_x = nn.Parameter(min_x - self.qmin_x*self.alpha_x)
         
         # Dataset[train, val]: E[w]=0.08601280301809311, E[w^2]=1.1822082996368408. (First batch of images.mean(): -0.1799)
         elif alpha_init == 3:
@@ -162,13 +177,13 @@ class QuantizedWrapper(nn.Module):
         if isinstance(self.module, nn.Linear):
             if not (self.fp or fp):
                 if self.quant_scaler:
-                    quantized_weight = RoundWrapper.apply(self.full_precision_weight, self.alpha_w, self.beta_w, self.g_w, self.qmin_w, self.qmax_w) 
+                    self.quantized_weight = RoundWrapper.apply(self.full_precision_weight, self.alpha_w, self.beta_w, self.g_w, self.qmin_w, self.qmax_w) 
                     x = RoundWrapper.apply(x, self.alpha_x, self.beta_x, 1.0/math.sqrt(x.numel() * self.qmax_x), self.qmin_x, self.qmax_x) 
                 else:
-                    quantized_weight = FakeQuantizeSTE.apply(self.full_precision_weight, self.qstep_w, self.qmin_w, self.qmax_w) if self.quant_w else self.full_precision_weight
+                    self.quantized_weight = FakeQuantizeSTE.apply(self.full_precision_weight, self.qstep_w, self.qmin_w, self.qmax_w) if self.quant_w else self.full_precision_weight
                     x = FakeQuantizeSTE.apply(x, self.qstep_x, self.qmin_x, self.qmax_x) if self.quant_x else x
 
-                y = F.linear(x, quantized_weight, self.module.bias)
+                y = F.linear(x, self.quantized_weight, self.module.bias)
                 # y = RoundWrapper.apply(y, self.alpha_x, self.beta_x, 1.0/math.sqrt(y.numel() * self.qmax_x), self.qmin_x, self.qmax_x) 
                 return y
             else:
@@ -177,13 +192,13 @@ class QuantizedWrapper(nn.Module):
         elif isinstance(self.module, nn.Conv2d):
             if not (self.fp or fp):
                 if self.quant_scaler:
-                    quantized_weight = RoundWrapper.apply(self.full_precision_weight, self.alpha_w, self.beta_w, self.g_w, self.qmin_w, self.qmax_w) 
+                    self.quantized_weight = RoundWrapper.apply(self.full_precision_weight, self.alpha_w, self.beta_w, self.g_w, self.qmin_w, self.qmax_w) 
                     x = RoundWrapper.apply(x, self.alpha_x, self.beta_x, 1.0/math.sqrt(x.numel() * self.qmax_x), self.qmin_x, self.qmax_x) 
                 else:
-                    quantized_weight = FakeQuantizeSTE.apply(self.full_precision_weight, self.qstep_w, self.qmin_w, self.qmax_w) if self.quant_w else self.full_precision_weight
+                    self.quantized_weight = FakeQuantizeSTE.apply(self.full_precision_weight, self.qstep_w, self.qmin_w, self.qmax_w) if self.quant_w else self.full_precision_weight
                     x = FakeQuantizeSTE.apply(x, self.qstep_x, self.qmin_x, self.qmax_x) if self.quant_x else x
                 
-                y = F.conv2d(x, quantized_weight, self.module.bias, stride=self.module.stride, 
+                y = F.conv2d(x, self.quantized_weight, self.module.bias, stride=self.module.stride, 
                                 padding=self.module.padding, groups=self.module.groups, dilation=self.module.dilation)
                 # y = RoundWrapper.apply(y, self.alpha_x, self.beta_x, 1.0/math.sqrt(y.numel() * self.qmax_x), self.qmin_x, self.qmax_x) 
                 return y
@@ -211,12 +226,16 @@ class QuantizedWrapper(nn.Module):
             return y  
 
 
-def apply_quantization(model, quant_w=True, quant_x=True, quant_scaler=False, bitwidth_w=16, intbit_w=2, bitwidth_x=16, intbit_x=2, alpha_init=None):
+def apply_quantization(model, pre_name = '', quant_w=True, quant_x=True, quant_scaler=False, bitwidth_w=16, intbit_w=2, bitwidth_x=16, intbit_x=2, alpha_init=None):
     for name, module in model.named_children():
+        cur_name = pre_name+'.'+name if pre_name != '' else name
         if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
-            setattr(model, name, QuantizedWrapper(module, quant_w, quant_x, quant_scaler, bitwidth_w, intbit_w, bitwidth_x, intbit_x, alpha_init=alpha_init))  
+            wrapper = QuantizedWrapper(module, quant_w, quant_x, quant_scaler, bitwidth_w, intbit_w, bitwidth_x, intbit_x, alpha_init=alpha_init)
+            wrapper.register_forward_hook(get_activation(name=cur_name))
+            setattr(model, name, wrapper)  
+            
         else:
-            apply_quantization(module, quant_w, quant_x, quant_scaler, bitwidth_w, intbit_w, bitwidth_x, intbit_x, alpha_init=alpha_init) 
+            apply_quantization(module, cur_name, quant_w, quant_x, quant_scaler, bitwidth_w, intbit_w, bitwidth_x, intbit_x, alpha_init=alpha_init) 
     return model
 
 def kl_loss(output_quantized, output_full_precision):
@@ -279,7 +298,7 @@ class ResnetQAT(nn.Module):
         x = torch.flatten(x, 1)
         x = self.fc(x)
         return x
-
+    
 def train(model,
           model_target,
             n_epoch = 100,
@@ -308,6 +327,7 @@ def train(model,
     iters = len(train_loader)
     grad_states = []
     start_quant = False
+    best_acc_val = 0
     for epoch in range(n_epoch):
         loss_ep = []
         loss_ep_val = []
@@ -319,9 +339,11 @@ def train(model,
         acc_ep_fp_val = []
 
         for batch_i, (images, labels) in enumerate(train_loader):
+            # print(f'barch: {batch_i}')
             optimizer.zero_grad()
             grad_state={}
             images_fp, labels = images.to(device), labels.to(device)
+            # print(f'images range: {images_fp.min()} ~ {images_fp.max()}')
             # with torch.no_grad():
             pred_fp = model_target.forward(images_fp, fp = True) if model_target else model.forward(images_fp, fp = True)
 
@@ -335,12 +357,12 @@ def train(model,
             loss_ce_fp = criterion(pred_fp, labels) 
             loss_ce = criterion(pred, labels) 
             loss_kl = kl_loss(pred, pred_fp) if KL else torch.tensor(0).to(device)
-            loss = loss_ce + loss_kl if fp_fixed else loss_ce_fp + loss_ce + loss_kl if start_quant else loss_ce_fp 
+            loss = 2*loss_ce + loss_kl if fp_fixed else loss_ce_fp + loss_ce + loss_kl if start_quant else loss_ce_fp 
 
             loss.backward()
             optimizer.step()
             if args.lr_scheduler:
-                scheduler.step(epoch + batch_i / iters)
+                scheduler.step()
 
             pred = torch.argmax(pred, dim=1)
             acc = torch.mean(pred==labels, dtype=torch.float)
@@ -352,7 +374,12 @@ def train(model,
             acc_fp = torch.mean(pred_fp==labels, dtype=torch.float)
             acc_ep_fp.append(acc_fp.item())
 
-        
+            # for name, input in activation_in.items():
+            #     writer.add_histogram(f'{name}/Train/Input', input, epoch*len(train_loader)+batch_i)
+            # for name, output in activation_out.items():
+            #     writer.add_histogram(f'{name}/Train/Output', output, epoch*len(train_loader)+batch_i)
+
+            
         for batch_i, (images, labels) in enumerate(val_loader):
             images_fp, labels = images.to(device), labels.to(device)
             # with torch.no_grad():
@@ -374,12 +401,17 @@ def train(model,
             acc_val = torch.mean(pred==labels, dtype=torch.float)
             
             loss_ep_val.append(loss_val.item())
-            loss_kl_ep_val.append(loss_kl.item())
+            loss_kl_ep_val.append(loss_kl_val.item())
             acc_ep_val.append(acc_val.item())
 
             pred_fp = torch.argmax(pred_fp, dim=1)
             acc_fp_val = torch.mean(pred_fp==labels, dtype=torch.float)
             acc_ep_fp_val.append(acc_fp_val.item())
+
+        for name, input in activation_in.items():
+            writer.add_histogram(f'{name}/Val/Input', input, epoch)
+        for name, output in activation_out.items():
+            writer.add_histogram(f'{name}/Val/Output', output, epoch)
         
         loss = sum(loss_ep)/len(train_loader)
         loss_val = sum(loss_ep_val)/len(val_loader)
@@ -443,8 +475,13 @@ def train(model,
         if (epoch+1)%print_freq==0:
             print(f'epoch:{epoch+1}, time:{(time.time() - start):.2f}, loss:{loss:.4f}, acc:{acc:.4f}, acc_fp:{acc_fp:.4f}, loss_val:{loss_val:.4f}, acc_val:{acc_val:.4f}, acc_fp_val:{acc_fp_val:.4f}')
 
+        if acc_val >= best_acc_val:
+            best_acc_val = acc_val
+            best_acc = acc
+            best_model = {'model': model,
+                          'acc': best_acc_val}
         if save_ckp and (epoch+1)%save_freq==0:
-            torch.save(model, save_path+f'epoch{epoch+1}_tacc{acc:.3f}_vacc{acc_val:.3f}.ckp')
+            torch.save(best_model, save_path+f'epoch{epoch+1}_tacc{best_acc:.3f}_vacc{best_acc_val:.3f}.ckp', pickle_module=dill)
 
     writer.close()
     plt.plot(loss_curve, label='train')
@@ -457,7 +494,7 @@ def train(model,
     plt.legend()
     plt.savefig(save_path + f'acc.jpg')
     print(f'Finished. Results saved in {save_path}')
-    np.save(save_path+'grad_states.npy', grad_states)
+    # np.save(save_path+'grad_states.npy', grad_states)
 
 def train_fp(model,
             n_epoch = 100,
@@ -485,7 +522,7 @@ def train_fp(model,
             loss.backward()
             optimizer.step()
             if args.lr_scheduler:
-                scheduler.step(epoch + batch_i / iters)
+                scheduler.step()
 
             pred = torch.argmax(pred, dim=1)
             acc = torch.mean(pred==labels, dtype=torch.float)
@@ -540,7 +577,7 @@ def csd_intersect(csd_model, csd_target, load_target):
     print(f'Load {cnt}/{len(keys_model)} parameters from {load_target}.')
     return csd_model
 
-
+    
 if __name__=="__main__":
     args = args_parser()
     seed = args.seed
@@ -574,6 +611,7 @@ if __name__=="__main__":
     if save_ckp:
         save_path=increment_path(f'./images/test_training/')
         writer = SummaryWriter(save_path)
+    
         
     h, w, ch, n_cls, k = 32, 32, 3, 10, args.k
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -603,7 +641,7 @@ if __name__=="__main__":
     val_loader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
                                                 shuffle=False, num_workers=2)
     if args.load_pretrained != '':
-        model = torch.load(args.load_pretrained, map_location=device)
+        model = torch.load(args.load_pretrained, map_location=device, pickle_module=dill)['model']
     else:  
         if mod == 'vgg16':
             model = torchvision.models.vgg16(weights = 'DEFAULT')
@@ -650,7 +688,7 @@ if __name__=="__main__":
             model = ResnetQAT(model=model)      
 
     model_target = torch.load(args.load_target, map_location=device) if args.load_target != '' else None
-    if args.load_target_csd:
+    if args.load_target_csd and not args.load_pretrained:
         csd_target = model_target.state_dict()
         csd_model = model.state_dict()
         csd_model = csd_intersect(csd_model=csd_model, csd_target=csd_target, load_target=args.load_target)
@@ -658,7 +696,8 @@ if __name__=="__main__":
 
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=args.weight_decay)
     if args.lr_scheduler:
-        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer=optimizer, T_0=1, T_mult=1)
+        # scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer=optimizer, T_0=1, T_mult=1)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=n_epoch, eta_min=1e-4)
     criterion = nn.CrossEntropyLoss()
 
     if fp_only:

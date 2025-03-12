@@ -1,6 +1,12 @@
 
 import numpy as np
 import torch
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
 
 def quantizearray(input, step, min, max):
     quantized = input/step
@@ -10,3 +16,4 @@ def quantizearray(input, step, min, max):
     quantized = quantized.requires_grad_()
     quantized.retain_grad()
     return quantized
+
