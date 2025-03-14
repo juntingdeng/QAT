@@ -1,0 +1,34 @@
+seed: 0
+
+model: 'efficientnet' #choices=['vgg16', 'mobilenetv3', 'efficientnet', 'resnet18']
+load_target: 
+  efficientnet: './images/test_training/runs856/epoch100_tacc0.9929_vacc0.9524.ckp'
+  resnet18: './images/test_training/runs855/epoch100_tacc1.0000_vacc0.9343.ckp' #
+load_pretrained: ''
+load_target_csd: True #
+fp_only: False
+fp_fixed: True
+_1st_1last: False
+
+alpha_init: 2
+quant_scaler: True
+quant_w: True
+quant_x: True
+eps: 0.
+
+bitwidth_w: 4
+intbit_w: 0
+bitwidth_x: 4
+intbit_x: 0
+
+lr: 1.0e-3
+noKL: False
+optim: 'adam'
+batch_size: 128
+weight_decay: 0
+lr_scheduler: True
+n_epoch: 500
+
+print_freq: 1
+save_freq: 50
+nosave_ckp: False

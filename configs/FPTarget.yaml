@@ -1,0 +1,2 @@
+'efficientnet': './images/test_training/runs832/epoch50_tacc0.989_vacc0.950.ckp',
+'resnet18': './images/test_training/runs846/epoch50_tacc1.000_vacc0.934.ckp',

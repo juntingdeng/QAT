@@ -11,14 +11,15 @@ from train_quantization import QuantizedWrapper, RoundWrapper
 import argparse
 from torch.utils.tensorboard import SummaryWriter
 import dill
+from PIL import Image
 
 def args_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--quantw', action='store_true')
     parser.add_argument('--quantx', action='store_true')
     parser.add_argument('--inference', action='store_true')
-    parser.add_argument('--data_statistic', action='store_true')
-    parser.add_argument('--weight_statistic', default=True, action='store_true')
+    parser.add_argument('--data_statistic', default=True, action='store_true')
+    parser.add_argument('--weight_statistic', action='store_true')
     parser.add_argument('--save_path', type=str)
 
     parser.add_argument('--bitwidth_w', default=4, type=int)
@@ -60,18 +61,19 @@ if __name__ == "__main__":
                 param.data = quantizearray(param.data, step=step_sizew, min=wqmin, max=wqmax)
 
     transform_train = transforms.Compose([
-        transforms.Resize(256, interpolation=InterpolationMode.BICUBIC),
+        transforms.Resize(256, interpolation=InterpolationMode.BILINEAR),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
         
     transform_test = transforms.Compose([
-        transforms.Resize(256, interpolation=InterpolationMode.BICUBIC),
+        transforms.Resize(256, interpolation=InterpolationMode.BILINEAR),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
+
 
     model.eval()
     trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
@@ -97,6 +99,11 @@ if __name__ == "__main__":
             xmax = max(xmax, images.max())
 
         for batch_i, (images, labels) in enumerate(testloader):
+            # img = images[0].detach().cpu().numpy().transpose(1,2,0)
+            # img = 255*((img - img.min())/(img.max() - img.min()))
+            # img = Image.fromarray(img.astype(np.uint8))
+            # img.save('test.jpg')
+            # break
             images, labels = images.to(device), labels.to(device)
             avg_w.append(images.mean())
             avg_w2.append(torch.square(images).mean())
