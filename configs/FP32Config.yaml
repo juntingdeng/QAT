@@ -9,7 +9,7 @@ fp_fixed: False
 _1st_1last: False
 
 alpha_init: 2
-quant_scaler: False
+lsq: False
 quant_w: False
 quant_x: False
 eps: 0.

@@ -11,7 +11,7 @@ fp_fixed: True
 _1st_1last: False
 
 alpha_init: 2
-quant_scaler: True
+lsq: True
 quant_w: True
 quant_x: True
 eps: 0.
