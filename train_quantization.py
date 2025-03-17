@@ -49,13 +49,14 @@ def increment_path(p):
     os.mkdir(run)
     print(f'Results saved in {run}')
     return run
-
+ 
 def args_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--parse_yaml', action='store_true')
+    parser.add_argument('--parse_cmd', action='store_true')
     parser.add_argument('--config', default='./configs/LSQConfig.yaml', type=str)
     
     parser.add_argument('--seed', default=0)
+    parser.add_argument('--data', default='cifar10', choices=['cifar10', 'cifar100', 'imagenet'])
     parser.add_argument('--model', default='resnet18', choices=['vgg16', 'mobilenetv3', 'efficientnet', 'resnet18'])
     parser.add_argument('--load_target', default='./images/test_training/runs846/epoch50_tacc1.000_vacc0.934.ckp', type=str,) 
     parser.add_argument('--load_pretrained', default='', type=str,)
@@ -452,9 +453,9 @@ activation_in = {}
 activation_out = {}
 if __name__ == '__main__':
     args = args_parser()
+    args_yaml = yaml_parser(args.config, args=args)
 
-    if args.parse_yaml:
-        args_yaml = yaml_parser(args.config, args=args)
+    if not args.parse_cmd and args_yaml:
         for k, v in vars(args).items():
             if k in args_yaml.keys():
                 vars(args)[k] = args_yaml[k][args_yaml['model']] if k == 'load_target' and args_yaml['load_target']!='' \
@@ -522,15 +523,19 @@ if __name__ == '__main__':
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
 
-    trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
-                                            download=True, transform=transform_train)
-    train_loader = torch.utils.data.DataLoader(trainset, batch_size=batch_size,
-                                            shuffle=True, num_workers=2)
+    if args.data == 'cifar10':
+        trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
+        testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
+    elif args.data == 'cifar100':
+        trainset = torchvision.datasets.CIFAR100(root='./data', train=True, download=True, transform=transform_train)
+        testset = torchvision.datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_test)
+    elif args.data == 'imagenet':
+        trainset = torchvision.datasets.ImageNet(root='./data', train=True, download=True, transform=transform_train)
+        testset = torchvision.datasets.ImageNet(root='./data', train=False, download=True, transform=transform_test)
+    
+    train_loader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=2)
+    val_loader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=2)
 
-    testset = torchvision.datasets.CIFAR10(root='./data', train=False,
-                                        download=True, transform=transform_test)
-    val_loader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
-                                                shuffle=False, num_workers=2)
     if args.load_pretrained != '':
         model = torch.load(args.load_pretrained, map_location=device, pickle_module=dill)['model']
     else:  

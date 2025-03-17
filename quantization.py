@@ -17,6 +17,16 @@ def quantizearray(input, step, min, max):
     quantized.retain_grad()
     return quantized
 
+class STEWrapper(torch.autograd.Function):
+    @staticmethod
+    def forward(self,x):
+        y = x.round()
+        return y 
+
+    @staticmethod
+    def backward(self, grad_output):
+        return grad_output
+    
 class FixPointQuant(torch.autograd.Function):
     @staticmethod
     def forward(self, weights, step, min_val, max_val):
@@ -33,7 +43,7 @@ class LSQuant(torch.autograd.Function):
         ctx.save_for_backward(weights, alpha, beta)
         ctx.g, ctx.qmin, ctx.qmax = g, qmin, qmax
         _weights_q = ((weights-beta)/alpha).round().clamp(qmin, qmax)
-        weights_q = _weights_q * alpha
+        weights_q = _weights_q * alpha + beta
         return weights_q
 
     @staticmethod
@@ -47,12 +57,13 @@ class LSQuant(torch.autograd.Function):
         ind_mid = 1. - ind_small - ind_big
 
         grad_alpha = ((ind_small * qmin + ind_big * qmax + ind_mid * (- _weights_q + _weights_q.round())) * grad_weight * g).sum().view(1)
-        grad_weight = ind_mid * grad_weight
         grad_beta = ((ind_mid * 0 + ind_big + ind_small)* grad_weight * g).sum().view(1)
+        grad_weight = ind_mid * grad_weight
+        
         return grad_weight, grad_alpha, grad_beta, None, None, None
 
 class QuantizedWrapper(nn.Module):
-    def __init__(self, module, quant_w=True, quant_x=True, lsq=False, 
+    def __init__(self, module, quant_w=True, quant_x=True, lsq=None,
                  bitwidth_w=16, intbit_w=2, bitwidth_x=16, intbit_x=2, _1st_1last=False, alpha_init=None):
         super().__init__()
         self.module = module  
@@ -87,8 +98,8 @@ class QuantizedWrapper(nn.Module):
                 mu_w, sigma_w = self.full_precision_weight.mean(), self.full_precision_weight.std()
                 mu_x, sigma_x = 0.08617200702428818, 0.8140683770179749
                 min_x, max_x = -2.1179039478302, 2.640000104904175
-                self.alpha_w = nn.Parameter(torch.tensor(max(abs(mu_w-3*sigma_w), abs(mu_w+3*sigma_w))/self.qmax_w))
-                self.beta_w = nn.Parameter(torch.tensor(mu_w))
+                self.alpha_w = nn.Parameter(max(abs(mu_w-3*sigma_w), abs(mu_w+3*sigma_w))/self.qmax_w)
+                self.beta_w = nn.Parameter(mu_w)
                 self.alpha_x = nn.Parameter(torch.tensor((max_x - min_x)/(self.qmax_x - self.qmin_x)))
                 self.beta_x = nn.Parameter(min_x - self.qmin_x*self.alpha_x)
             
@@ -103,9 +114,14 @@ class QuantizedWrapper(nn.Module):
         # self.module.bias = None
         if isinstance(self.module, nn.Linear):
             if not (self.fp or fp):
-                if self.lsq:
+                if self.lsq==1:
                     self.quantized_weight = LSQuant.apply(self.full_precision_weight, self.alpha_w, self.beta_w, self.g_w, self.qmin_w, self.qmax_w) 
                     x = LSQuant.apply(x, self.alpha_x, self.beta_x, 1.0/math.sqrt(x.numel() * self.qmax_x), self.qmin_x, self.qmax_x) 
+
+                elif self.lsq==2:
+                    self.quantized_weight = self.alpha_w*STEWrapper.apply((self.full_precision_weight-self.beta_w)/self.alpha_w).clamp(self.qmin_w, self.qmax_w) + self.beta_w
+                    x = self.alpha_x*STEWrapper.apply((x-self.beta_x)/self.alpha_x).clamp(self.qmin_x, self.qmax_x) + self.beta_x
+
                 else:
                     self.quantized_weight = FixPointQuant.apply(self.full_precision_weight, self.qstep_w, self.qmin_w, self.qmax_w) if self.quant_w else self.full_precision_weight
                     x = FixPointQuant.apply(x, self.qstep_x, self.qmin_x, self.qmax_x) if self.quant_x else x
@@ -117,9 +133,14 @@ class QuantizedWrapper(nn.Module):
             
         elif isinstance(self.module, nn.Conv2d):
             if not (self.fp or fp):
-                if self.lsq:
+                if self.lsq==1:
                     self.quantized_weight = LSQuant.apply(self.full_precision_weight, self.alpha_w, self.beta_w, self.g_w, self.qmin_w, self.qmax_w) 
                     x = LSQuant.apply(x, self.alpha_x, self.beta_x, 1.0/math.sqrt(x.numel() * self.qmax_x), self.qmin_x, self.qmax_x) 
+
+                elif self.lsq==2:
+                    self.quantized_weight = self.alpha_w*STEWrapper.apply((self.full_precision_weight-self.beta_w)/self.alpha_w).clamp(self.qmin_w, self.qmax_w) + self.beta_w
+                    x = self.alpha_x*STEWrapper.apply((x-self.beta_x)/self.alpha_x).clamp(self.qmin_x, self.qmax_x) + self.beta_x 
+                
                 else:
                     self.quantized_weight = FixPointQuant.apply(self.full_precision_weight, self.qstep_w, self.qmin_w, self.qmax_w) if self.quant_w else self.full_precision_weight
                     x = FixPointQuant.apply(x, self.qstep_x, self.qmin_x, self.qmax_x) if self.quant_x else x
@@ -150,7 +171,7 @@ class QuantizedWrapper(nn.Module):
             y = LSQuant.apply(y, self.alpha_x, self.beta_x, 1.0/math.sqrt(y.numel() * self.qmax_x), self.qmin_x, self.qmax_x) 
             return y  
 
-def apply_quantization(model, pre_name = '', quant_w=True, quant_x=True, lsq=False, 
+def apply_quantization(model, pre_name = '', quant_w=True, quant_x=True, lsq=None,
                        bitwidth_w=16, intbit_w=2, bitwidth_x=16, intbit_x=2, alpha_init=None, activation_in=None, activation_out=None):
     for name, module in model.named_children():
         cur_name = pre_name+'.'+name if pre_name != '' else name

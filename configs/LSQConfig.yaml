@@ -11,7 +11,7 @@ fp_fixed: True
 _1st_1last: False
 
 alpha_init: 2
-lsq: True
+lsq: 2
 quant_w: True
 quant_x: True
 eps: 0.
@@ -21,7 +21,7 @@ intbit_w: 0
 bitwidth_x: 4
 intbit_x: 0
 
-lr: 1.0e-3
+lr: 1.0e-4
 noKL: False
 optim: 'adam'
 batch_size: 128
