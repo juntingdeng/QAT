@@ -1,6 +1,6 @@
 seed: 0
 
-data: 'cifar10' #choices=['cifar10', 'cifar100', 'imagenet']
+data: 'imagenet' #choices=['cifar10', 'cifar100', 'imagenet']
 model: 'efficientnet' #choices=['vgg16', 'mobilenetv3', 'efficientnet', 'resnet18']
 load_target: '' #
 load_pretrained: ''

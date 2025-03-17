@@ -526,12 +526,15 @@ if __name__ == '__main__':
     if args.data == 'cifar10':
         trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
         testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
+        n_cls = 10
     elif args.data == 'cifar100':
         trainset = torchvision.datasets.CIFAR100(root='./data', train=True, download=True, transform=transform_train)
         testset = torchvision.datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_test)
+        n_cls = 100
     elif args.data == 'imagenet':
         trainset = torchvision.datasets.ImageNet(root='./data', train=True, download=True, transform=transform_train)
         testset = torchvision.datasets.ImageNet(root='./data', train=False, download=True, transform=transform_test)
+        n_cls = 1000
     
     train_loader = torch.utils.data.DataLoader(trainset, batch_size=batch_size, shuffle=True, num_workers=2)
     val_loader = torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False, num_workers=2)
@@ -541,15 +544,15 @@ if __name__ == '__main__':
     else:  
         if mod == 'vgg16':
             model = torchvision.models.vgg16(weights = 'DEFAULT')
-            model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, 10)
+            model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, n_cls)
             model = model.to(device)
         elif mod == 'mobilenetv3':
             model = torchvision.models.mobilenet_v3_large(weights = 'DEFAULT')
-            model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, 10)
+            model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, n_cls)
             model = model.to(device)
         elif mod == 'efficientnet':
             model = torchvision.models.efficientnet_b0(weights = 'DEFAULT') 
-            model.classifier[1] = nn.Linear(model.classifier[1].in_features, 10)
+            model.classifier[1] = nn.Linear(model.classifier[1].in_features, n_cls)
             model = model.to(device)
             model = apply_quantization(model, quant_w=quant_w, quant_x=quant_x, lsq=lsq, bitwidth_w=bitwidth_w, 
                                         intbit_w=intbit_w, bitwidth_x=bitwidth_x, intbit_x=intbit_x, alpha_init=alpha_init,
@@ -558,7 +561,7 @@ if __name__ == '__main__':
         
         elif mod == 'resnet18':
             model = torchvision.models.resnet18(weights = 'DEFAULT')
-            model.fc = nn.Linear(model.fc.in_features, 10)
+            model.fc = nn.Linear(model.fc.in_features, n_cls)
             model = model.to(device)
             # if quant_w or quant_x:
             model = apply_quantization(model, quant_w=quant_w, quant_x=quant_x, lsq=lsq, bitwidth_w=bitwidth_w, 

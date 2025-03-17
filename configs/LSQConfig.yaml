@@ -21,7 +21,7 @@ intbit_w: 0
 bitwidth_x: 4
 intbit_x: 0
 
-lr: 1.0e-4
+lr: 1.0e-3
 noKL: False
 optim: 'adam'
 batch_size: 128
