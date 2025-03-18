@@ -9,9 +9,10 @@ load_target_csd: True #
 fp_only: False
 fp_fixed: True
 _1st_1last: False
+interp: cubic
 
 alpha_init: 2
-lsq: 2
+lsq: 1
 quant_w: True
 quant_x: True
 eps: 0.

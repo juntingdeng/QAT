@@ -6,8 +6,7 @@ from torchvision.transforms.functional import InterpolationMode
 import numpy as np
 import torch.nn as nn
 import matplotlib.pyplot as plt
-from quantization import quantizearray
-from train_quantization import QuantizedWrapper, RoundWrapper
+from quantization import *
 import argparse
 from torch.utils.tensorboard import SummaryWriter
 import dill
@@ -18,7 +17,9 @@ def args_parser():
     parser.add_argument('--quantw', action='store_true')
     parser.add_argument('--quantx', action='store_true')
     parser.add_argument('--inference', action='store_true')
-    parser.add_argument('--data_statistic', default=True, action='store_true')
+    parser.add_argument('--data_statistic',  default=True, action='store_true')
+    parser.add_argument('--data_interp', action='store_true')
+    parser.add_argument('--interp_mod', type=str, default='linear')
     parser.add_argument('--weight_statistic', action='store_true')
     parser.add_argument('--save_path', type=str)
 
@@ -36,6 +37,7 @@ if __name__ == "__main__":
     model = torch.load('./images/test_training/runs792/epoch150_tacc0.992_vacc0.835.ckp', map_location=device, pickle_module=dill)
     model = model['model'] if isinstance(model, dict) else model
     data_statistic = args.data_statistic
+    data_interp = args.data_interp
     inference = args.inference
     weight_statistic = args.weight_statistic
 
@@ -60,15 +62,20 @@ if __name__ == "__main__":
             if name.split('.')[-1] == 'alpha_w':
                 param.data = quantizearray(param.data, step=step_sizew, min=wqmin, max=wqmax)
 
+    if args.interp_mod == 'linear':
+        interp = InterpolationMode.BILINEAR
+    elif args.interp_mod == 'cubic':
+        interp = InterpolationMode.BICUBIC
+
     transform_train = transforms.Compose([
-        transforms.Resize(256, interpolation=InterpolationMode.BILINEAR),
+        transforms.Resize(256, interpolation=interp),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
         
     transform_test = transforms.Compose([
-        transforms.Resize(256, interpolation=InterpolationMode.BILINEAR),
+        transforms.Resize(256, interpolation=interp),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
@@ -113,6 +120,17 @@ if __name__ == "__main__":
 
         print(f'Range: {xmin} ~ {xmax}, E[w]: {sum(avg_w)/len(avg_w)}, E[w^2]: {sum(avg_w2)/len(avg_w2)}, std: {sum(std)/len(std)}')
     
+    if data_interp:
+        std = []
+        for batch_i, (images, labels) in enumerate(trainloader):
+            img = images[0].detach().cpu().numpy().transpose(1,2,0)
+            std.append(img.std())
+
+        for batch_i, (images, labels) in enumerate(testloader):
+            img = images[0].detach().cpu().numpy().transpose(1,2,0)
+            std.append(img.std())
+            
+
     if inference:
         acc_ep_val = []
         for batch_i, (images, labels) in enumerate(trainloader):

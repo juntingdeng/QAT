@@ -94,9 +94,11 @@ class QuantizedWrapper(nn.Module):
                 self.alpha_x = nn.Parameter(2*self.full_precision_weight.abs().mean()/math.sqrt(self.qmax_x))
     
             elif alpha_init == 2: #LSQ+
-                # Dataset[train, val]: E[w]=0.08617200702428818, E[w^2]=1.1822057962417603, std=0.8140683770179749
+                # BILINEAR -- Dataset[train, val]: Range(-2.1179039478302,2.640000104904175), E[w]=0.08617200702428818, E[w^2]=1.1822057962417603, std=0.8140683770179749
+                # BILINEAR(test2) -- Dataset[train, val]: Range(-2.1179039478302,2.640000104904175), E[w]: 0.08747030794620514, E[w^2]: 1.1379928588867188, std: 0.7935436964035034
+                # BICUBIC -- Dataset[train, val]: Range(-2.1179039478302,2.640000104904175), E[w]=0.0860467255115509, E[w^2]=1.1820635795593262, std= 0.8139052987098694
                 mu_w, sigma_w = self.full_precision_weight.mean(), self.full_precision_weight.std()
-                mu_x, sigma_x = 0.08617200702428818, 0.8140683770179749
+                mu_x, sigma_x = 0.08617200702428818, 0.8140683770179749 ## BILINEAR
                 min_x, max_x = -2.1179039478302, 2.640000104904175
                 self.alpha_w = nn.Parameter(max(abs(mu_w-3*sigma_w), abs(mu_w+3*sigma_w))/self.qmax_w)
                 self.beta_w = nn.Parameter(mu_w)

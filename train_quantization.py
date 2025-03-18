@@ -64,6 +64,7 @@ def args_parser():
     parser.add_argument('--fp_only', action='store_true')
     parser.add_argument('--fp_fixed', action='store_true')
     parser.add_argument('--_1st_1last', action='store_true')
+    parser.add_argument('--interp', default='linear', choices=['linear', 'cubic'])
 
     parser.add_argument('--alpha_init', default=2, type=float)
     parser.add_argument('--lsq', action='store_true')
@@ -509,15 +510,20 @@ if __name__ == '__main__':
     h, w, ch, n_cls = 32, 32, 3, 10
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+    if args.interp == 'cubic':
+        interp = InterpolationMode.BICUBIC
+    elif args.interp == 'linear':
+        interp = InterpolationMode.BILINEAR
+
     transform_train = transforms.Compose([
-        transforms.Resize(256, interpolation=InterpolationMode.BILINEAR), #Efficientnet: BICUBIC, Resnet: BILINEAR
+        transforms.Resize(256, interpolation=interp), #Efficientnet: BICUBIC, Resnet: BILINEAR
         transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
 
     transform_test = transforms.Compose([
-        transforms.Resize(256, interpolation=InterpolationMode.BILINEAR),
+        transforms.Resize(256, interpolation=interp),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
