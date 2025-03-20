@@ -1,18 +1,20 @@
 seed: 0
 
-model: 'efficientnet' #choices=['vgg16', 'mobilenetv3', 'efficientnet', 'resnet18']
+model: 'resnet101' #choices=['vgg16', 'mobilenetv3', 'efficientnet', 'resnet18']
 load_target: 
   efficientnet: './images/test_training/runs856/epoch100_tacc0.9929_vacc0.9524.ckp'
   resnet18: './images/test_training/runs855/epoch100_tacc1.0000_vacc0.9343.ckp' #
+  resnet101: './images/test_training/runs877/epoch100_tacc0.9999_vacc0.9588.ckp' 
 load_pretrained: ''
 load_target_csd: True #
 fp_only: False
 fp_fixed: True
 _1st_1last: False
-interp: cubic
+interp: linear
+replace_qtlayer: True
 
 alpha_init: 2
-lsq: 1
+lsq: 2
 quant_w: True
 quant_x: True
 eps: 0.
@@ -28,7 +30,7 @@ optim: 'adam'
 batch_size: 128
 weight_decay: 0
 lr_scheduler: True
-n_epoch: 500
+n_epoch: 200
 
 print_freq: 1
 save_freq: 50

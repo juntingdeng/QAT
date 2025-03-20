@@ -65,6 +65,7 @@ def args_parser():
     parser.add_argument('--fp_fixed', action='store_true')
     parser.add_argument('--_1st_1last', action='store_true')
     parser.add_argument('--interp', default='linear', choices=['linear', 'cubic'])
+    parser.add_argument('--replace_qtlayer', action='store_true')
 
     parser.add_argument('--alpha_init', default=2, type=float)
     parser.add_argument('--lsq', action='store_true')
@@ -113,7 +114,9 @@ class EfficientnetQAT(nn.Module):
 
     def forward(self, x, fp = False):
         for module in self.modules():
-            if isinstance(module, QuantizedWrapper):
+            if isinstance(module, QuantizedWrapper) or \
+                isinstance(module, QtConv2d) or \
+                isinstance(module, QtLinear):
                 module.fp = fp
 
         x = self.features(x)
@@ -449,6 +452,27 @@ def csd_intersect(csd_model, csd_target, load_target):
     logger.info(f'Load {cnt}/{len(keys_model)} parameters from {load_target}.')
     return csd_model
 
+def csd_intersect_(csd_model, csd_target, load_target):
+    keys_model = csd_model.keys()
+    keys_target = csd_target.keys()
+    cnt = 0
+    notloaded = []
+    for k, v in csd_target.items():
+        if k in keys_model and csd_model[k].shape == v.shape:
+            csd_model[k] = csd_target[k]
+            cnt += 1
+
+        elif k.split('.')[-1] == 'full_precision_weight':
+            knew = '.'.join(k.split('.')[:-1]+['weight']) 
+            if knew in keys_model and csd_model[knew].shape == v.shape:
+                csd_model[knew] = csd_target[k]
+                cnt += 1
+
+        else:
+            notloaded.append(k)
+    logger.info(f'Load {cnt}/{len(keys_model)} parameters from {load_target}.')
+    return csd_model
+
 
 activation_in = {}
 activation_out = {}
@@ -560,17 +584,28 @@ if __name__ == '__main__':
             model = torchvision.models.efficientnet_b0(weights = 'DEFAULT') 
             model.classifier[1] = nn.Linear(model.classifier[1].in_features, n_cls)
             model = model.to(device)
-            model = apply_quantization(model, quant_w=quant_w, quant_x=quant_x, lsq=lsq, bitwidth_w=bitwidth_w, 
+
+            if args.replace_qtlayer:
+                model = replace_QtLayer(model=model, lsq=lsq, bitwidth_w=bitwidth_w, bitwidth_x=bitwidth_x)
+            else:
+                model = apply_quantization(model, quant_w=quant_w, quant_x=quant_x, lsq=lsq, bitwidth_w=bitwidth_w, 
                                         intbit_w=intbit_w, bitwidth_x=bitwidth_x, intbit_x=intbit_x, alpha_init=alpha_init,
                                         activation_in=activation_in, activation_out=activation_out)
+            
             model = EfficientnetQAT(model=model)
         
-        elif mod == 'resnet18':
-            model = torchvision.models.resnet18(weights = 'DEFAULT')
+        elif mod[:6] == 'resnet':
+            if mod[6:]=='18':
+                model = torchvision.models.resnet18(weights = 'DEFAULT') 
+            elif mod[6:]=='101':
+                model = torchvision.models.resnet101(weights = 'DEFAULT')
+                 
             model.fc = nn.Linear(model.fc.in_features, n_cls)
             model = model.to(device)
-            # if quant_w or quant_x:
-            model = apply_quantization(model, quant_w=quant_w, quant_x=quant_x, lsq=lsq, bitwidth_w=bitwidth_w, 
+            if args.replace_qtlayer:
+                model = replace_QtLayer(model=model, lsq=lsq, bitwidth_w=bitwidth_w, bitwidth_x=bitwidth_x)
+            else:
+                model = apply_quantization(model, quant_w=quant_w, quant_x=quant_x, lsq=lsq, bitwidth_w=bitwidth_w, 
                                         intbit_w=intbit_w, bitwidth_x=bitwidth_x, intbit_x=intbit_x, alpha_init=alpha_init,
                                         activation_in=activation_in, activation_out=activation_out)
             model = ResnetQAT(model=model)      
@@ -597,7 +632,7 @@ if __name__ == '__main__':
     if args.load_target_csd and not args.load_pretrained:
         csd_target = model_target.state_dict()
         csd_model = model.state_dict()
-        csd_model = csd_intersect(csd_model=csd_model, csd_target=csd_target, load_target=args.load_target)
+        csd_model = csd_intersect_(csd_model=csd_model, csd_target=csd_target, load_target=args.load_target)
         model.load_state_dict(csd_model)
 
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=args.weight_decay) if args.optim == 'adam' \

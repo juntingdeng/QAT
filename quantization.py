@@ -92,6 +92,8 @@ class QuantizedWrapper(nn.Module):
             if alpha_init == 1: #LSQ
                 self.alpha_w = nn.Parameter(2*self.full_precision_weight.abs().mean()/math.sqrt(self.qmax_w))
                 self.alpha_x = nn.Parameter(2*self.full_precision_weight.abs().mean()/math.sqrt(self.qmax_x))
+                self.beta_w = nn.Parameter(torch.tensor(0.))
+                self.beta_x = nn.Parameter(torch.tensor(0.))
     
             elif alpha_init == 2: #LSQ+
                 # BILINEAR -- Dataset[train, val]: Range(-2.1179039478302,2.640000104904175), E[w]=0.08617200702428818, E[w^2]=1.1822057962417603, std=0.8140683770179749
@@ -111,6 +113,8 @@ class QuantizedWrapper(nn.Module):
                 e1_x, e2_x, c1_x, c2_x = 0.08601280301809311, 1.1822082996368408, 3.2, -2.1
                 self.alpha_w = nn.Parameter(torch.tensor(c1_w*math.sqrt(e2_w)-c2_w*e1_w)/math.sqrt(self.qmax_w)) 
                 self.alpha_x = nn.Parameter(torch.tensor(c1_x*math.sqrt(e2_x)-c2_x*e1_x)/math.sqrt(self.qmax_x)) 
+                self.beta_w = nn.Parameter(torch.tensor(0.))
+                self.beta_x = nn.Parameter(torch.tensor(0.))
 
     def forward(self, x, fp=False):
         # self.module.bias = None
@@ -194,3 +198,129 @@ def get_activation(name, activation_in, activation_out):
                 else (x.detach() for x in input_tuple)
         activation_out[name] = output.detach()
     return hook
+
+class QtConv2d(nn.Conv2d):
+    def __init__(self,
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=1,
+            padding=0,
+            dilation=1,
+            groups=1,
+            bias=True,
+            padding_mode='zeros', 
+            device=None,
+            dtype=None,
+            wbit=4,
+            xbit=4,
+            lsq=1,
+            fp=False):
+        super().__init__(in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+            bias,
+            padding_mode,
+            device=device,
+            dtype=dtype,)
+        self.wbit = wbit
+        self.xbit = xbit
+        self.qmax_w = pow(2, self.wbit-1) - 1
+        self.qmin_w = -pow(2, self.wbit-1)
+        self.qmax_x = pow(2, self.xbit-1) - 1
+        self.qmin_x = -pow(2, self.xbit-1)
+        self.lsq=lsq
+        self.fp=fp
+
+        mu_w, sigma_w = self.weight.mean(), self.weight.std()
+        min_x, max_x = -2.1179039478302, 2.640000104904175
+        self.alpha_w = nn.Parameter(max(abs(mu_w-3*sigma_w), abs(mu_w+3*sigma_w))/self.qmax_w)
+        self.beta_w = nn.Parameter(mu_w)
+        self.alpha_x = nn.Parameter(torch.tensor((max_x - min_x)/(self.qmax_x - self.qmin_x)))
+        self.beta_x = nn.Parameter(min_x - self.qmin_x*self.alpha_x)
+        self.g_w = 1.0 / math.sqrt(self.weight.numel() * self.qmax_w)
+
+    def forward(self, input):
+        if self.fp:
+            return self._conv_forward(input, self.weight, self.bias)
+        
+        if self.lsq == 1:
+            qweight = LSQuant.apply(self.weight, self.alpha_w, self.beta_w, self.g_w, self.qmin_w, self.qmax_w) 
+            qinput = LSQuant.apply(input, self.alpha_x, self.beta_x, 1.0/math.sqrt(input.numel() * self.qmax_x), self.qmin_x, self.qmax_x) 
+        elif self.lsq == 2:
+            qweight = self.alpha_w*STEWrapper.apply((self.weight-self.beta_w)/self.alpha_w).clamp(self.qmin_w, self.qmax_w) + self.beta_w
+            qinput = self.alpha_x*STEWrapper.apply((input-self.beta_x)/self.alpha_x).clamp(self.qmin_x, self.qmax_x) + self.beta_x
+
+        return self._conv_forward(qinput, qweight, self.bias)
+
+class QtLinear(nn.Linear):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        bias=True,
+        device=None,
+        dtype=None,
+        wbit=4,
+        xbit=4,
+        lsq=1,
+        fp=False):
+        super().__init__(in_features,
+                out_features,
+                bias,
+                device,
+                dtype,)
+        
+        self.wbit = wbit
+        self.xbit = xbit
+        self.qmax_w = pow(2, self.wbit-1) - 1
+        self.qmin_w = -pow(2, self.wbit-1)
+        self.qmax_x = pow(2, self.xbit-1) - 1
+        self.qmin_x = -pow(2, self.xbit-1)
+        self.lsq=lsq
+        self.fp=fp
+
+        mu_w, sigma_w = self.weight.mean(), self.weight.std()
+        min_x, max_x = -2.1179039478302, 2.640000104904175
+        self.alpha_w = nn.Parameter(max(abs(mu_w-3*sigma_w), abs(mu_w+3*sigma_w))/self.qmax_w)
+        self.beta_w = nn.Parameter(mu_w)
+        self.alpha_x = nn.Parameter(torch.tensor((max_x - min_x)/(self.qmax_x - self.qmin_x)))
+        self.beta_x = nn.Parameter(min_x - self.qmin_x*self.alpha_x)
+        self.g_w = 1.0 / math.sqrt(self.weight.numel() * self.qmax_w)
+
+    def forward(self, input):
+        if self.fp:
+            return F.linear(input, self.weight, self.bias)
+        
+        if self.lsq == 1:
+            qweight = LSQuant.apply(self.weight, self.alpha_w, self.beta_w, self.g_w, self.qmin_w, self.qmax_w) 
+            qinput = LSQuant.apply(input, self.alpha_x, self.beta_x, 1.0/math.sqrt(input.numel() * self.qmax_x), self.qmin_x, self.qmax_x) 
+        elif self.lsq == 2:
+            qweight = self.alpha_w*STEWrapper.apply((self.weight-self.beta_w)/self.alpha_w).clamp(self.qmin_w, self.qmax_w) + self.beta_w
+            qinput = self.alpha_x*STEWrapper.apply((input-self.beta_x)/self.alpha_x).clamp(self.qmin_x, self.qmax_x) + self.beta_x
+        
+        return F.linear(qinput, qweight, self.bias)
+
+def replace_QtLayer(model, lsq=None, bitwidth_w=16, bitwidth_x=16):
+    for name, module in model.named_children():
+        if isinstance(module, nn.Linear):
+            bias = module.bias if module.bias == None else True
+            qtLayer = QtLinear(module.in_features, module.out_features, bias,
+                               device=module.weight.device, dtype=module.weight.dtype,
+                            wbit=bitwidth_w, xbit=bitwidth_x, lsq=lsq)
+            setattr(model, name, qtLayer)  
+        elif isinstance(module, nn.Conv2d):
+            bias = module.bias if module.bias == None else True
+            qtLayer = QtConv2d(module.in_channels, module.out_channels, module.kernel_size, module.stride,
+                               module.padding, module.dilation, module.groups, bias, module.padding_mode, 
+                               device=module.weight.device, dtype=module.weight.dtype,
+                            wbit=bitwidth_w, xbit=bitwidth_x, lsq=lsq)
+            setattr(model, name, qtLayer)  
+        else:
+            replace_QtLayer(module, lsq, bitwidth_w, bitwidth_x)
+    return model
+
